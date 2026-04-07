@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import sqlite3
 import tarfile
 from datetime import UTC, datetime
@@ -230,7 +231,8 @@ def test_catalog_default_lists_summary_and_runs(fake_crypto, repo: tuple[Path, P
     assert "Catalog Summary" in result.output
     assert "Backup Runs" in result.output
     assert "COMPLETED" in result.output
-    assert str(source) in result.output
+    assert socket.gethostname() in result.output
+    assert "Run sources:" not in result.output
 
 
 def test_catalog_plaintext_is_pipe_friendly(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
@@ -246,6 +248,7 @@ def test_catalog_plaintext_is_pipe_friendly(fake_crypto, repo: tuple[Path, Path,
     assert "Backup Runs" not in result.output
     assert "SUMMARY\t" in result.output
     assert "RUN\t" in result.output
+    assert socket.gethostname() in result.output
     assert str(source) in result.output
 
 
@@ -265,6 +268,7 @@ def test_catalog_run_shows_files_for_specific_backup(fake_crypto, repo: tuple[Pa
     assert result.exit_code == 0, result.output
     assert "Run Detail" in result.output
     assert "Run Files" in result.output
+    assert socket.gethostname() in result.output
     assert "one.txt" in result.output
     assert "two.txt" not in result.output
 

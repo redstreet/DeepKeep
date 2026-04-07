@@ -750,7 +750,7 @@ def catalog_runs(config: dict[str, object]) -> list[sqlite3.Row]:
     db = connect_db(config)
     rows = db.execute(
         """
-        SELECT run_id, started_at, completed_at, source_path, files_scanned, files_new, files_deduped,
+        SELECT run_id, started_at, completed_at, machine, source_path, files_scanned, files_new, files_deduped,
                bytes_new, bytes_total_scanned, packs_created, status
         FROM backup_runs
         ORDER BY started_at DESC
@@ -764,7 +764,7 @@ def catalog_run_detail(config: dict[str, object], run_id: str) -> tuple[sqlite3.
     db = connect_db(config)
     run_row = db.execute(
         """
-        SELECT run_id, started_at, completed_at, source_path, files_scanned, files_new, files_deduped,
+        SELECT run_id, started_at, completed_at, machine, source_path, files_scanned, files_new, files_deduped,
                bytes_new, bytes_total_scanned, packs_created, status
         FROM backup_runs
         WHERE run_id = ?
@@ -887,7 +887,7 @@ def render_runs(rows: list[sqlite3.Row], plaintext: bool) -> None:
         for row in rows:
             click.echo(
                 "RUN\t"
-                f"{row['run_id']}\t{row['started_at']}\t{row['completed_at'] or ''}\t{row['status']}\t"
+                f"{row['run_id']}\t{row['started_at']}\t{row['completed_at'] or ''}\t{row['status']}\t{row['machine'] or ''}\t"
                 f"{row['files_scanned']}\t{row['files_new']}\t{row['files_deduped']}\t"
                 f"{row['bytes_new']}\t{row['packs_created']}\t{row['source_path']}"
             )
@@ -899,6 +899,7 @@ def render_runs(rows: list[sqlite3.Row], plaintext: bool) -> None:
     table.add_column("Run ID")
     table.add_column("Started")
     table.add_column("Status")
+    table.add_column("Machine")
     table.add_column("New", justify="right")
     table.add_column("Deduped", justify="right")
     table.add_column("Packs", justify="right")
@@ -908,15 +909,13 @@ def render_runs(rows: list[sqlite3.Row], plaintext: bool) -> None:
             row["run_id"],
             row["started_at"],
             row["status"],
+            row["machine"] or "",
             str(row["files_new"]),
             str(row["files_deduped"]),
             str(row["packs_created"]),
             row["source_path"],
         )
     console.print(table)
-    console.print("Run sources:")
-    for row in rows:
-        console.print(f"{row['run_id']}: {row['source_path']}")
 
 
 def render_files(rows: list[sqlite3.Row], plaintext: bool, title: str = "Catalog Files") -> None:
@@ -1103,7 +1102,7 @@ def catalog_run_cmd(ctx: click.Context, run_id: str, plaintext: bool) -> None:
     if use_plaintext:
         click.echo(
             "RUN_DETAIL\t"
-            f"{run_row['run_id']}\t{run_row['started_at']}\t{run_row['completed_at'] or ''}\t{run_row['status']}\t"
+            f"{run_row['run_id']}\t{run_row['started_at']}\t{run_row['completed_at'] or ''}\t{run_row['status']}\t{run_row['machine'] or ''}\t"
             f"{run_row['files_scanned']}\t{run_row['files_new']}\t{run_row['files_deduped']}\t"
             f"{run_row['bytes_new']}\t{run_row['bytes_total_scanned']}\t{run_row['packs_created']}\t{run_row['source_path']}"
         )
@@ -1116,6 +1115,7 @@ def catalog_run_cmd(ctx: click.Context, run_id: str, plaintext: bool) -> None:
             ("Started", run_row["started_at"]),
             ("Completed", run_row["completed_at"] or ""),
             ("Status", run_row["status"]),
+            ("Machine", run_row["machine"] or ""),
             ("Source", run_row["source_path"]),
             ("Files scanned", run_row["files_scanned"]),
             ("Files new", run_row["files_new"]),
