@@ -65,6 +65,7 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
     assert any("catalog" in path.as_posix() for path in pack_files)
     assert len(db_rows(config, "SELECT * FROM files")) == 2
     assert len(db_rows(config, "SELECT * FROM file_paths")) == 3
+    assert len(db_rows(config, "SELECT * FROM run_files")) == 2
 
     pack_path = next(path for path in pack_files if "pack-" in path.name)
     with tarfile.open(pack_path) as tf:
@@ -91,6 +92,7 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
     assert result.exit_code == 0, result.output
     assert len(db_rows(config, "SELECT * FROM files")) == 2
     assert len(db_rows(config, "SELECT * FROM file_paths")) == 2
+    assert len(db_rows(config, "SELECT * FROM run_files")) == 0
 
 
 def test_dedupe_second_backup_creates_no_new_pack(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
@@ -101,6 +103,7 @@ def test_dedupe_second_backup_creates_no_new_pack(fake_crypto, repo: tuple[Path,
     first_count = len(list(storage.rglob("pack-*.gpg")))
     assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
     assert len(list(storage.rglob("pack-*.gpg"))) == first_count
+    assert len(db_rows(config, "SELECT * FROM run_files")) == 1
 
 
 def test_oversize_file_becomes_single_pack(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
@@ -208,10 +211,13 @@ def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path], monke
     assert committed == 1
     rows = db.execute("SELECT pack_id FROM packs").fetchall()
     assert len(rows) == 1
+    run_rows = db.execute("SELECT path, pack_id FROM run_files").fetchall()
+    assert len(run_rows) == 1
+    assert run_rows[0][0] == "resume.txt"
     db.close()
 
 
-def test_catalog_command_lists_files_and_backup_runs(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+def test_catalog_default_lists_summary_and_runs(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
     source, _, config = repo
     (source / "a.txt").write_text("alpha")
     (source / "b.txt").write_text("beta")
@@ -221,10 +227,8 @@ def test_catalog_command_lists_files_and_backup_runs(fake_crypto, repo: tuple[Pa
 
     result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config)])
     assert result.exit_code == 0, result.output
-    assert "Catalog Files" in result.output
+    assert "Catalog Summary" in result.output
     assert "Backup Runs" in result.output
-    assert "a.txt" in result.output
-    assert "b.txt" in result.output
     assert "COMPLETED" in result.output
     assert str(source) in result.output
 
@@ -238,8 +242,65 @@ def test_catalog_plaintext_is_pipe_friendly(fake_crypto, repo: tuple[Path, Path,
 
     result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "--plaintext"])
     assert result.exit_code == 0, result.output
-    assert "Catalog Files" not in result.output
+    assert "Catalog Summary" not in result.output
     assert "Backup Runs" not in result.output
-    assert "FILE\tplain.txt\t" in result.output
+    assert "SUMMARY\t" in result.output
     assert "RUN\t" in result.output
     assert str(source) in result.output
+
+
+def test_catalog_run_shows_files_for_specific_backup(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, _, config = repo
+    (source / "one.txt").write_text("one")
+    runner = CliRunner()
+    first = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert first.exit_code == 0, first.output
+    first_run = db_rows(config, "SELECT run_id FROM backup_runs ORDER BY started_at DESC")[0][0]
+
+    (source / "two.txt").write_text("two")
+    second = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert second.exit_code == 0, second.output
+
+    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "run", first_run])
+    assert result.exit_code == 0, result.output
+    assert "Run Detail" in result.output
+    assert "Run Files" in result.output
+    assert "one.txt" in result.output
+    assert "two.txt" not in result.output
+
+
+def test_catalog_files_supports_run_filter_and_plaintext(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, _, config = repo
+    (source / "keep-a.txt").write_text("a")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+    run_id = db_rows(config, "SELECT run_id FROM backup_runs ORDER BY started_at DESC")[0][0]
+
+    (source / "keep-b.txt").write_text("b")
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        deepkeep.cli,
+        ["catalog", "--config", str(config), "files", "--run-id", run_id, "--plaintext"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "FILE\tkeep-a.txt\t" in result.output
+    assert "keep-b.txt" not in result.output
+
+
+def test_catalog_packs_and_file_detail(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, _, config = repo
+    (source / "detail.txt").write_text("detail")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "packs", "--plaintext"])
+    assert result.exit_code == 0, result.output
+    assert "PACK\t" in result.output
+
+    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "file", "detail.txt", "--plaintext"])
+    assert result.exit_code == 0, result.output
+    assert "FILE_DETAIL\tdetail.txt\t" in result.output

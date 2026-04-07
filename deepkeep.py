@@ -212,6 +212,17 @@ def connect_db(config: dict[str, object]) -> sqlite3.Connection:
             status TEXT NOT NULL,
             notes TEXT
         );
+        CREATE TABLE IF NOT EXISTS run_files (
+            run_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime TEXT,
+            pack_id TEXT,
+            PRIMARY KEY (run_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_files_run_id ON run_files(run_id);
+        CREATE INDEX IF NOT EXISTS idx_run_files_pack_id ON run_files(pack_id);
         """
     )
     return db
@@ -416,7 +427,7 @@ def snapshot_catalog(config: dict[str, object], backend: LocalBackend | S3Backen
         return
     ts = utc_now()
     with tempfile.TemporaryDirectory() as tmp:
-        enc = Path(tmp) / "catalog.sqlite.age"
+        enc = Path(tmp) / "catalog.sqlite.gpg"
         encrypt_file(catalog, enc, config)
         latest_key, snap_key = catalog_object_keys(ts)
         backend.put_object(latest_key, str(enc))
@@ -431,7 +442,7 @@ def commit_pack(db: sqlite3.Connection, stage: dict[str, object]) -> None:
             stage["object_key"],
             stage["created_at"],
             "off",
-            "age",
+            "gpg",
             1,
             stage["run_id"],
         ),
@@ -444,6 +455,10 @@ def commit_pack(db: sqlite3.Connection, stage: dict[str, object]) -> None:
         db.execute(
             "INSERT OR REPLACE INTO file_paths(path, sha256, mtime) VALUES (?, ?, ?)",
             (item["original_path"], item["sha256"], item.get("mtime")),
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO run_files(run_id, path, sha256, size, mtime, pack_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (stage["run_id"], item["original_path"], item["sha256"], item["size"], item.get("mtime"), stage["pack_id"]),
         )
     db.commit()
 
@@ -479,7 +494,7 @@ def new_pack_state(config: dict[str, object], run_id: str) -> tuple[dict[str, ob
         "object_key": object_key,
         "status": "BUILDING",
         "tar_path": str(pack_dir / "pack.tar"),
-        "enc_path": str(pack_dir / "pack.tar.age"),
+        "enc_path": str(pack_dir / "pack.tar.gpg"),
         "entries": [],
     }
     return state, pack_dir
@@ -697,7 +712,7 @@ def rebuild_catalog(config: dict[str, object]) -> int:
             created_at = str(manifest.get("created_at", utc_now()))
             db.execute(
                 "INSERT OR REPLACE INTO packs(pack_id, object_key, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (pack_id, key, created_at, "off", "age", 1, "rebuild"),
+                (pack_id, key, created_at, "off", "gpg", 1, "rebuild"),
             )
             for item in manifest["files"]:
                 db.execute(
@@ -709,29 +724,272 @@ def rebuild_catalog(config: dict[str, object]) -> int:
                     (item["original_path"], item["sha256"], item.get("mtime")),
                 )
             count += 1
+        db.execute("DELETE FROM run_files")
         db.commit()
     return count
 
 
-def read_catalog(config: dict[str, object]) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+def catalog_summary(config: dict[str, object]) -> sqlite3.Row:
     db = connect_db(config)
-    files = db.execute(
+    row = db.execute(
         """
-        SELECT fp.path, f.size, fp.mtime, f.pack_id
-        FROM file_paths fp
-        JOIN files f ON f.sha256 = fp.sha256
-        ORDER BY fp.path
+        SELECT
+            (SELECT COUNT(*) FROM backup_runs) AS run_count,
+            (SELECT COUNT(*) FROM file_paths) AS path_count,
+            (SELECT COUNT(*) FROM files) AS unique_file_count,
+            (SELECT COUNT(*) FROM packs) AS pack_count,
+            COALESCE((SELECT SUM(f.size) FROM file_paths fp JOIN files f ON f.sha256 = fp.sha256), 0) AS logical_bytes,
+            COALESCE((SELECT SUM(size) FROM files), 0) AS unique_bytes
         """
-    ).fetchall()
-    runs = db.execute(
+    ).fetchone()
+    db.close()
+    return row
+
+
+def catalog_runs(config: dict[str, object]) -> list[sqlite3.Row]:
+    db = connect_db(config)
+    rows = db.execute(
         """
-        SELECT run_id, started_at, completed_at, source_path, files_scanned, files_new, files_deduped, packs_created, status
+        SELECT run_id, started_at, completed_at, source_path, files_scanned, files_new, files_deduped,
+               bytes_new, bytes_total_scanned, packs_created, status
         FROM backup_runs
         ORDER BY started_at DESC
         """
     ).fetchall()
     db.close()
-    return files, runs
+    return rows
+
+
+def catalog_run_detail(config: dict[str, object], run_id: str) -> tuple[sqlite3.Row | None, list[sqlite3.Row], list[sqlite3.Row]]:
+    db = connect_db(config)
+    run_row = db.execute(
+        """
+        SELECT run_id, started_at, completed_at, source_path, files_scanned, files_new, files_deduped,
+               bytes_new, bytes_total_scanned, packs_created, status
+        FROM backup_runs
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    pack_rows = db.execute(
+        """
+        SELECT p.pack_id, p.created_at, p.object_key, p.run_id, COUNT(f.sha256) AS file_count, COALESCE(SUM(f.size), 0) AS total_bytes
+        FROM packs p
+        LEFT JOIN files f ON f.pack_id = p.pack_id
+        WHERE p.run_id = ?
+        GROUP BY p.pack_id, p.created_at, p.object_key, p.run_id
+        ORDER BY p.created_at, p.pack_id
+        """,
+        (run_id,),
+    ).fetchall()
+    file_rows = db.execute(
+        """
+        SELECT path, size, mtime, pack_id
+        FROM run_files
+        WHERE run_id = ?
+        ORDER BY path
+        """,
+        (run_id,),
+    ).fetchall()
+    db.close()
+    return run_row, pack_rows, file_rows
+
+
+def catalog_files(config: dict[str, object], prefix: str | None = None, pack_id: str | None = None, run_id: str | None = None) -> list[sqlite3.Row]:
+    db = connect_db(config)
+    sql = [
+        """
+        SELECT fp.path, f.size, fp.mtime, f.pack_id, rf.run_id
+        FROM file_paths fp
+        JOIN files f ON f.sha256 = fp.sha256
+        LEFT JOIN run_files rf ON rf.path = fp.path AND rf.sha256 = fp.sha256
+        """
+    ]
+    params: list[object] = []
+    conditions: list[str] = []
+    if prefix:
+        conditions.append("fp.path LIKE ?")
+        params.append(f"{prefix}%")
+    if pack_id:
+        conditions.append("f.pack_id = ?")
+        params.append(pack_id)
+    if run_id:
+        conditions.append("rf.run_id = ?")
+        params.append(run_id)
+    if conditions:
+        sql.append("WHERE " + " AND ".join(conditions))
+    sql.append("ORDER BY fp.path")
+    rows = db.execute("\n".join(sql), params).fetchall()
+    db.close()
+    return rows
+
+
+def catalog_packs(config: dict[str, object]) -> list[sqlite3.Row]:
+    db = connect_db(config)
+    rows = db.execute(
+        """
+        SELECT p.pack_id, p.created_at, p.object_key, p.run_id, COUNT(f.sha256) AS file_count, COALESCE(SUM(f.size), 0) AS total_bytes
+        FROM packs p
+        LEFT JOIN files f ON f.pack_id = p.pack_id
+        GROUP BY p.pack_id, p.created_at, p.object_key, p.run_id
+        ORDER BY p.created_at DESC, p.pack_id DESC
+        """
+    ).fetchall()
+    db.close()
+    return rows
+
+
+def catalog_file_detail(config: dict[str, object], path: str) -> sqlite3.Row | None:
+    db = connect_db(config)
+    row = db.execute(
+        """
+        SELECT fp.path, f.size, fp.mtime, fp.sha256, f.pack_id, f.tar_path, rf.run_id
+        FROM file_paths fp
+        JOIN files f ON f.sha256 = fp.sha256
+        LEFT JOIN run_files rf ON rf.path = fp.path AND rf.sha256 = fp.sha256
+        WHERE fp.path = ?
+        """,
+        (path,),
+    ).fetchone()
+    db.close()
+    return row
+
+
+def print_no_rows(label: str, plaintext: bool) -> None:
+    if plaintext:
+        click.echo(f"INFO\t{label}\tnone")
+    else:
+        console.print(f"{label}: none")
+
+
+def render_summary(summary: sqlite3.Row, plaintext: bool) -> None:
+    if plaintext:
+        click.echo(
+            "SUMMARY\t"
+            f"{summary['run_count']}\t{summary['path_count']}\t{summary['unique_file_count']}\t"
+            f"{summary['pack_count']}\t{summary['logical_bytes']}\t{summary['unique_bytes']}"
+        )
+        return
+    table = Table(title="Catalog Summary")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Runs", str(summary["run_count"]))
+    table.add_row("Archived paths", str(summary["path_count"]))
+    table.add_row("Unique blobs", str(summary["unique_file_count"]))
+    table.add_row("Packs", str(summary["pack_count"]))
+    table.add_row("Logical bytes", str(summary["logical_bytes"]))
+    table.add_row("Unique bytes", str(summary["unique_bytes"]))
+    console.print(table)
+
+
+def render_runs(rows: list[sqlite3.Row], plaintext: bool) -> None:
+    if plaintext:
+        for row in rows:
+            click.echo(
+                "RUN\t"
+                f"{row['run_id']}\t{row['started_at']}\t{row['completed_at'] or ''}\t{row['status']}\t"
+                f"{row['files_scanned']}\t{row['files_new']}\t{row['files_deduped']}\t"
+                f"{row['bytes_new']}\t{row['packs_created']}\t{row['source_path']}"
+            )
+        return
+    if not rows:
+        print_no_rows("Runs", plaintext=False)
+        return
+    table = Table(title="Backup Runs")
+    table.add_column("Run ID")
+    table.add_column("Started")
+    table.add_column("Status")
+    table.add_column("New", justify="right")
+    table.add_column("Deduped", justify="right")
+    table.add_column("Packs", justify="right")
+    table.add_column("Source", overflow="fold")
+    for row in rows:
+        table.add_row(
+            row["run_id"],
+            row["started_at"],
+            row["status"],
+            str(row["files_new"]),
+            str(row["files_deduped"]),
+            str(row["packs_created"]),
+            row["source_path"],
+        )
+    console.print(table)
+    console.print("Run sources:")
+    for row in rows:
+        console.print(f"{row['run_id']}: {row['source_path']}")
+
+
+def render_files(rows: list[sqlite3.Row], plaintext: bool, title: str = "Catalog Files") -> None:
+    if plaintext:
+        for row in rows:
+            click.echo(f"FILE\t{row['path']}\t{row['size']}\t{row['mtime'] or ''}\t{row['pack_id']}\t{row['run_id'] or ''}")
+        return
+    if not rows:
+        print_no_rows("Files", plaintext=False)
+        return
+    table = Table(title=title)
+    table.add_column("Path", overflow="fold")
+    table.add_column("Size", justify="right")
+    table.add_column("Modified")
+    table.add_column("Pack")
+    table.add_column("Run")
+    for row in rows:
+        table.add_row(row["path"], str(row["size"]), row["mtime"] or "", row["pack_id"], row["run_id"] or "")
+    console.print(table)
+
+
+def render_packs(rows: list[sqlite3.Row], plaintext: bool, title: str = "Packs") -> None:
+    if plaintext:
+        for row in rows:
+            click.echo(
+                f"PACK\t{row['pack_id']}\t{row['created_at']}\t{row['object_key']}\t{row['run_id']}\t{row['file_count']}\t{row['total_bytes']}"
+            )
+        return
+    if not rows:
+        print_no_rows("Packs", plaintext=False)
+        return
+    table = Table(title=title)
+    table.add_column("Pack ID")
+    table.add_column("Created")
+    table.add_column("Run")
+    table.add_column("Files", justify="right")
+    table.add_column("Bytes", justify="right")
+    table.add_column("Object Key", overflow="fold")
+    for row in rows:
+        table.add_row(
+            row["pack_id"],
+            row["created_at"],
+            row["run_id"],
+            str(row["file_count"]),
+            str(row["total_bytes"]),
+            row["object_key"],
+        )
+    console.print(table)
+
+
+def render_file_detail(row: sqlite3.Row | None, plaintext: bool) -> None:
+    if row is None:
+        print_no_rows("File detail", plaintext)
+        return
+    if plaintext:
+        click.echo(
+            f"FILE_DETAIL\t{row['path']}\t{row['size']}\t{row['mtime'] or ''}\t{row['sha256']}\t{row['pack_id']}\t{row['tar_path']}\t{row['run_id'] or ''}"
+        )
+        return
+    table = Table(title="File Detail")
+    table.add_column("Field")
+    table.add_column("Value", overflow="fold")
+    for key, value in (
+        ("Path", row["path"]),
+        ("Size", row["size"]),
+        ("Modified", row["mtime"] or ""),
+        ("SHA256", row["sha256"]),
+        ("Pack", row["pack_id"]),
+        ("Tar Path", row["tar_path"]),
+        ("Run", row["run_id"] or ""),
+    ):
+        table.add_row(key, str(value))
+    console.print(table)
 
 
 def option_config(fn):
@@ -798,56 +1056,110 @@ def rebuild_catalog_cmd(config_path: Path) -> None:
     console.print(f"rebuilt catalog from {count} pack(s)")
 
 
-@cli.command("catalog")
+@cli.group("catalog", invoke_without_command=True)
 @option_config
 @click.option("--plaintext", is_flag=True, help="Print line-oriented text instead of rich tables.")
-def catalog_cmd(config_path: Path, plaintext: bool) -> None:
-    """Show archived files and backup run history."""
+@click.pass_context
+def catalog_group(ctx: click.Context, config_path: Path, plaintext: bool) -> None:
+    """Explore catalog summaries, runs, packs, and files."""
     config = load_config(config_path)
-    files, runs = read_catalog(config)
-    if plaintext:
-        for row in files:
-            click.echo(f"FILE\t{row['path']}\t{row['size']}\t{row['mtime'] or ''}\t{row['pack_id']}")
-        for row in runs:
-            click.echo(
-                "RUN\t"
-                f"{row['run_id']}\t{row['started_at']}\t{row['completed_at'] or ''}\t{row['status']}\t"
-                f"{row['files_new']}\t{row['files_deduped']}\t{row['packs_created']}\t{row['source_path']}"
-            )
-        return
+    ctx.obj = {"config": config, "plaintext": plaintext}
+    if ctx.invoked_subcommand is None:
+        render_summary(catalog_summary(config), plaintext)
+        render_runs(catalog_runs(config), plaintext)
 
-    file_table = Table(title="Catalog Files")
-    file_table.add_column("Path", overflow="fold")
-    file_table.add_column("Size", justify="right")
-    file_table.add_column("Modified")
-    file_table.add_column("Pack")
-    for row in files:
-        file_table.add_row(row["path"], str(row["size"]), row["mtime"] or "", row["pack_id"])
-    console.print(file_table)
 
-    run_table = Table(title="Backup Runs")
-    run_table.add_column("Started")
-    run_table.add_column("Completed")
-    run_table.add_column("Status")
-    run_table.add_column("New", justify="right")
-    run_table.add_column("Deduped", justify="right")
-    run_table.add_column("Packs", justify="right")
-    run_table.add_column("Source", overflow="fold")
-    for row in runs:
-        run_table.add_row(
-            row["started_at"],
-            row["completed_at"] or "",
-            row["status"],
-            str(row["files_new"]),
-            str(row["files_deduped"]),
-            str(row["packs_created"]),
-            row["source_path"],
+def catalog_context(ctx: click.Context) -> tuple[dict[str, object], bool]:
+    obj = ctx.find_object(dict) or {}
+    return obj["config"], bool(obj["plaintext"])
+
+
+@catalog_group.command("summary")
+@click.option("--plaintext", is_flag=True, help="Print line-oriented text instead of rich tables.")
+@click.pass_context
+def catalog_summary_cmd(ctx: click.Context, plaintext: bool) -> None:
+    config, default_plaintext = catalog_context(ctx)
+    render_summary(catalog_summary(config), plaintext or default_plaintext)
+
+
+@catalog_group.command("runs")
+@click.option("--plaintext", is_flag=True, help="Print line-oriented text instead of rich tables.")
+@click.pass_context
+def catalog_runs_cmd(ctx: click.Context, plaintext: bool) -> None:
+    config, default_plaintext = catalog_context(ctx)
+    render_runs(catalog_runs(config), plaintext or default_plaintext)
+
+
+@catalog_group.command("run")
+@click.argument("run_id")
+@click.option("--plaintext", is_flag=True, help="Print line-oriented text instead of rich tables.")
+@click.pass_context
+def catalog_run_cmd(ctx: click.Context, run_id: str, plaintext: bool) -> None:
+    config, default_plaintext = catalog_context(ctx)
+    use_plaintext = plaintext or default_plaintext
+    run_row, pack_rows, file_rows = catalog_run_detail(config, run_id)
+    if run_row is None:
+        raise click.ClickException(f"unknown run_id: {run_id}")
+    if use_plaintext:
+        click.echo(
+            "RUN_DETAIL\t"
+            f"{run_row['run_id']}\t{run_row['started_at']}\t{run_row['completed_at'] or ''}\t{run_row['status']}\t"
+            f"{run_row['files_scanned']}\t{run_row['files_new']}\t{run_row['files_deduped']}\t"
+            f"{run_row['bytes_new']}\t{run_row['bytes_total_scanned']}\t{run_row['packs_created']}\t{run_row['source_path']}"
         )
-    console.print(run_table)
-    if runs:
-        console.print("Run sources:")
-        for row in runs:
-            console.print(f"{row['run_id']}: {row['source_path']}")
+    else:
+        table = Table(title="Run Detail")
+        table.add_column("Field")
+        table.add_column("Value", overflow="fold")
+        for key, value in (
+            ("Run ID", run_row["run_id"]),
+            ("Started", run_row["started_at"]),
+            ("Completed", run_row["completed_at"] or ""),
+            ("Status", run_row["status"]),
+            ("Source", run_row["source_path"]),
+            ("Files scanned", run_row["files_scanned"]),
+            ("Files new", run_row["files_new"]),
+            ("Files deduped", run_row["files_deduped"]),
+            ("Bytes new", run_row["bytes_new"]),
+            ("Bytes scanned", run_row["bytes_total_scanned"]),
+            ("Packs created", run_row["packs_created"]),
+        ):
+            table.add_row(key, str(value))
+        console.print(table)
+    render_packs(pack_rows, use_plaintext, title="Run Packs")
+    run_files_rows = [
+        {"path": row["path"], "size": row["size"], "mtime": row["mtime"], "pack_id": row["pack_id"], "run_id": run_id}
+        for row in file_rows
+    ]
+    render_files(run_files_rows, use_plaintext, title="Run Files")
+
+
+@catalog_group.command("files")
+@click.option("--prefix", help="Only show archived paths under this prefix.")
+@click.option("--pack-id", help="Only show files stored in the given pack.")
+@click.option("--run-id", help="Only show files newly archived in the given run.")
+@click.option("--plaintext", is_flag=True, help="Print line-oriented text instead of rich tables.")
+@click.pass_context
+def catalog_files_cmd(ctx: click.Context, prefix: str | None, pack_id: str | None, run_id: str | None, plaintext: bool) -> None:
+    config, default_plaintext = catalog_context(ctx)
+    render_files(catalog_files(config, prefix=prefix, pack_id=pack_id, run_id=run_id), plaintext or default_plaintext)
+
+
+@catalog_group.command("packs")
+@click.option("--plaintext", is_flag=True, help="Print line-oriented text instead of rich tables.")
+@click.pass_context
+def catalog_packs_cmd(ctx: click.Context, plaintext: bool) -> None:
+    config, default_plaintext = catalog_context(ctx)
+    render_packs(catalog_packs(config), plaintext or default_plaintext)
+
+
+@catalog_group.command("file")
+@click.argument("path")
+@click.option("--plaintext", is_flag=True, help="Print line-oriented text instead of rich tables.")
+@click.pass_context
+def catalog_file_cmd(ctx: click.Context, path: str, plaintext: bool) -> None:
+    config, default_plaintext = catalog_context(ctx)
+    render_file_detail(catalog_file_detail(config, path), plaintext or default_plaintext)
 
 
 if __name__ == "__main__":
