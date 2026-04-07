@@ -55,6 +55,10 @@ def utc_now() -> str:
     return datetime.now(UTC).strftime(ISO)
 
 
+def parse_utc(value: str) -> datetime:
+    return datetime.strptime(value, ISO).replace(tzinfo=UTC)
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -646,6 +650,9 @@ def restore_prefixes(config: dict[str, object], prefixes: tuple[str, ...], dest:
                         raise DeepKeepError(f"hash mismatch while restoring {rel}")
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)
+                    if info.get("mtime"):
+                        ts = parse_utc(str(info["mtime"])).timestamp()
+                        os.utime(target, (ts, ts))
                     restored += 1
     return restored, pending
 

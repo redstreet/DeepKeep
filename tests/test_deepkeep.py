@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import tarfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -124,6 +126,25 @@ def test_restore_skips_existing_without_force(fake_crypto, repo: tuple[Path, Pat
     result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "--force", "keep"])
     assert result.exit_code == 0, result.output
     assert (dest / "keep.txt").read_text() == "fresh"
+
+
+def test_restore_reapplies_original_mtime(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
+    source, _, config = repo
+    original = source / "stamp.txt"
+    original.write_text("ts")
+    ts = datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC).timestamp()
+    os.utime(original, (ts, ts))
+
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    dest = tmp_path / "restore"
+    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "stamp"])
+    assert result.exit_code == 0, result.output
+    restored = dest / "stamp.txt"
+    assert restored.exists()
+    assert int(restored.stat().st_mtime) == int(ts)
 
 
 def test_verify_detects_corruption(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
