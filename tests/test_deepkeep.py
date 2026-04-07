@@ -188,3 +188,21 @@ def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path], monke
     rows = db.execute("SELECT pack_id FROM packs").fetchall()
     assert len(rows) == 1
     db.close()
+
+
+def test_catalog_command_lists_files_and_backup_runs(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, _, config = repo
+    (source / "a.txt").write_text("alpha")
+    (source / "b.txt").write_text("beta")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config)])
+    assert result.exit_code == 0, result.output
+    assert "Catalog Files" in result.output
+    assert "Backup Runs" in result.output
+    assert "a.txt" in result.output
+    assert "b.txt" in result.output
+    assert "COMPLETED" in result.output
+    assert str(source) in result.output

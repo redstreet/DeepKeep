@@ -706,6 +706,27 @@ def rebuild_catalog(config: dict[str, object]) -> int:
     return count
 
 
+def read_catalog(config: dict[str, object]) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+    db = connect_db(config)
+    files = db.execute(
+        """
+        SELECT fp.path, f.size, fp.mtime, f.pack_id
+        FROM file_paths fp
+        JOIN files f ON f.sha256 = fp.sha256
+        ORDER BY fp.path
+        """
+    ).fetchall()
+    runs = db.execute(
+        """
+        SELECT run_id, started_at, completed_at, source_path, files_scanned, files_new, files_deduped, packs_created, status
+        FROM backup_runs
+        ORDER BY started_at DESC
+        """
+    ).fetchall()
+    db.close()
+    return files, runs
+
+
 def option_config(fn):
     return click.option("--config", "config_path", type=click.Path(path_type=Path), default=Path("deepkeep.yaml"), show_default=True)(fn)
 
@@ -768,6 +789,47 @@ def rebuild_catalog_cmd(config_path: Path) -> None:
     config = load_config(config_path)
     count = rebuild_catalog(config)
     console.print(f"rebuilt catalog from {count} pack(s)")
+
+
+@cli.command("catalog")
+@option_config
+def catalog_cmd(config_path: Path) -> None:
+    """Show archived files and backup run history."""
+    config = load_config(config_path)
+    files, runs = read_catalog(config)
+
+    file_table = Table(title="Catalog Files")
+    file_table.add_column("Path", overflow="fold")
+    file_table.add_column("Size", justify="right")
+    file_table.add_column("Modified")
+    file_table.add_column("Pack")
+    for row in files:
+        file_table.add_row(row["path"], str(row["size"]), row["mtime"] or "", row["pack_id"])
+    console.print(file_table)
+
+    run_table = Table(title="Backup Runs")
+    run_table.add_column("Started")
+    run_table.add_column("Completed")
+    run_table.add_column("Status")
+    run_table.add_column("New", justify="right")
+    run_table.add_column("Deduped", justify="right")
+    run_table.add_column("Packs", justify="right")
+    run_table.add_column("Source", overflow="fold")
+    for row in runs:
+        run_table.add_row(
+            row["started_at"],
+            row["completed_at"] or "",
+            row["status"],
+            str(row["files_new"]),
+            str(row["files_deduped"]),
+            str(row["packs_created"]),
+            row["source_path"],
+        )
+    console.print(run_table)
+    if runs:
+        console.print("Run sources:")
+        for row in runs:
+            console.print(f"{row['run_id']}: {row['source_path']}")
 
 
 if __name__ == "__main__":
