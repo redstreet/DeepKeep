@@ -151,6 +151,51 @@ def test_restore_reapplies_original_mtime(fake_crypto, repo: tuple[Path, Path, P
     assert int(restored.stat().st_mtime) == int(ts)
 
 
+def test_restore_all_restores_everything(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
+    source, _, config = repo
+    (source / "a").mkdir()
+    (source / "a" / "one.txt").write_text("one")
+    (source / "two.txt").write_text("two")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    dest = tmp_path / "restore"
+    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "--all"])
+    assert result.exit_code == 0, result.output
+    assert (dest / "a" / "one.txt").read_text() == "one"
+    assert (dest / "two.txt").read_text() == "two"
+
+
+def test_restore_requires_prefix_or_all(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
+    source, _, config = repo
+    (source / "only.txt").write_text("one")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    dest = tmp_path / "restore"
+    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest)])
+    assert result.exit_code != 0
+    assert "provide at least one path prefix, or use --all" in result.output
+
+
+def test_restore_rejects_all_with_prefixes(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
+    source, _, config = repo
+    (source / "only.txt").write_text("one")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    dest = tmp_path / "restore"
+    result = runner.invoke(
+        deepkeep.cli,
+        ["restore", "--config", str(config), "--dest", str(dest), "--all", "only"],
+    )
+    assert result.exit_code != 0
+    assert "use either PREFIXES or --all, not both" in result.output
+
+
 def test_verify_detects_corruption(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
     source, storage, config = repo
     (source / "bad.txt").write_text("good")

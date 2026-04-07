@@ -617,7 +617,7 @@ def read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
             return json.load(fh)
 
 
-def restore_prefixes(config: dict[str, object], prefixes: tuple[str, ...], dest: Path, force: bool = False) -> tuple[int, int]:
+def restore_prefixes(config: dict[str, object], prefixes: tuple[str, ...], dest: Path, force: bool = False, restore_all: bool = False) -> tuple[int, int]:
     db = connect_db(config)
     rows = db.execute(
         """
@@ -628,10 +628,9 @@ def restore_prefixes(config: dict[str, object], prefixes: tuple[str, ...], dest:
         ORDER BY fp.path
         """
     ).fetchall()
-    matches = [row for row in rows if any(row["path"].startswith(prefix) for prefix in prefixes)]
+    matches = rows if restore_all else [row for row in rows if any(row["path"].startswith(prefix) for prefix in prefixes)]
     if not matches:
         return 0, 0
-    wanted = {row["path"]: dict(row) for row in matches}
     by_pack: dict[str, list[sqlite3.Row]] = defaultdict(list)
     for row in matches:
         by_pack[row["pack_id"]].append(row)
@@ -1019,14 +1018,17 @@ def backup(config_path: Path, dry_run: bool, source: Path) -> None:
 @cli.command("restore")
 @option_config
 @click.option("--dest", type=click.Path(path_type=Path), required=True)
+@click.option("--all", "restore_all", is_flag=True, help="Restore the entire catalog.")
 @click.option("--force", is_flag=True, help="Overwrite files already present at the destination.")
 @click.argument("prefixes", nargs=-1)
-def restore_cmd(config_path: Path, dest: Path, force: bool, prefixes: tuple[str, ...]) -> None:
+def restore_cmd(config_path: Path, dest: Path, restore_all: bool, force: bool, prefixes: tuple[str, ...]) -> None:
     """Restore archived files whose original paths match PREFIXES."""
-    if not prefixes:
-        raise click.UsageError("provide at least one path prefix")
+    if restore_all and prefixes:
+        raise click.UsageError("use either PREFIXES or --all, not both")
+    if not restore_all and not prefixes:
+        raise click.UsageError("provide at least one path prefix, or use --all")
     config = load_config(config_path)
-    restored, pending = restore_prefixes(config, prefixes, dest.resolve(), force=force)
+    restored, pending = restore_prefixes(config, prefixes, dest.resolve(), force=force, restore_all=restore_all)
     console.print(f"restored: {restored}")
     if pending:
         console.print(f"packs pending glacier restore: {pending}")
