@@ -793,10 +793,21 @@ def rebuild_catalog_cmd(config_path: Path) -> None:
 
 @cli.command("catalog")
 @option_config
-def catalog_cmd(config_path: Path) -> None:
+@click.option("--plaintext", is_flag=True, help="Print line-oriented text instead of rich tables.")
+def catalog_cmd(config_path: Path, plaintext: bool) -> None:
     """Show archived files and backup run history."""
     config = load_config(config_path)
     files, runs = read_catalog(config)
+    if plaintext:
+        for row in files:
+            click.echo(f"FILE\t{row['path']}\t{row['size']}\t{row['mtime'] or ''}\t{row['pack_id']}")
+        for row in runs:
+            click.echo(
+                "RUN\t"
+                f"{row['run_id']}\t{row['started_at']}\t{row['completed_at'] or ''}\t{row['status']}\t"
+                f"{row['files_new']}\t{row['files_deduped']}\t{row['packs_created']}\t{row['source_path']}"
+            )
+        return
 
     file_table = Table(title="Catalog Files")
     file_table.add_column("Path", overflow="fold")

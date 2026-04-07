@@ -206,3 +206,19 @@ def test_catalog_command_lists_files_and_backup_runs(fake_crypto, repo: tuple[Pa
     assert "b.txt" in result.output
     assert "COMPLETED" in result.output
     assert str(source) in result.output
+
+
+def test_catalog_plaintext_is_pipe_friendly(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, _, config = repo
+    (source / "plain.txt").write_text("hello")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "--plaintext"])
+    assert result.exit_code == 0, result.output
+    assert "Catalog Files" not in result.output
+    assert "Backup Runs" not in result.output
+    assert "FILE\tplain.txt\t" in result.output
+    assert "RUN\t" in result.output
+    assert str(source) in result.output
