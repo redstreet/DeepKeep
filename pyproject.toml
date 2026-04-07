@@ -1,0 +1,18 @@
+[project]
+name = "deepkeep"
+version = "0.1.0"
+description = "Personal archival backup CLI"
+requires-python = ">=3.12"
+dependencies = [
+  "click>=8.1",
+  "PyYAML>=6.0",
+  "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
