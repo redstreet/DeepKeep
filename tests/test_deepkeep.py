@@ -22,26 +22,33 @@ def fake_crypto(monkeypatch):
 
 
 @pytest.fixture()
-def repo(tmp_path: Path) -> tuple[Path, Path, Path]:
+def repo(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     source = tmp_path / "source"
     storage = tmp_path / "storage"
+    localcopy = tmp_path / "localcopy"
     source.mkdir()
     storage.mkdir()
+    localcopy.mkdir()
     config = tmp_path / "deepkeep.yaml"
     config.write_text(
         "\n".join(
             [
-                "backend: local",
+                "default_backend: glacier",
                 f"catalog_path: {tmp_path / 'catalog.sqlite'}",
                 "pack_size_mb: 1",
                 "age_pass_entry: backups/deepkeep",
                 f"work_root: {tmp_path / '.work'}",
-                "local:",
-                f"  root: {storage}",
+                "backends:",
+                "  glacier:",
+                "    type: local",
+                f"    root: {storage}",
+                "  localcopy:",
+                "    type: local",
+                f"    root: {localcopy}",
             ]
         )
     )
-    return source, storage, config
+    return source, storage, localcopy, config
 
 
 def db_rows(config: Path, sql: str):
@@ -95,11 +102,11 @@ def test_snapshot_catalog_writes_latest_every_run_but_weekly_snapshots(tmp_path:
     config = {
         "catalog_path": str(catalog),
         "work_root": str(tmp_path / ".work"),
-        "backend": "local",
-        "local": {"root": str(storage)},
+        "default_backend": "default",
+        "backends": {"default": {"type": "local", "root": str(storage)}},
         "age_pass_entry": "backups/deepkeep",
     }
-    backend = deepkeep.LocalBackend(storage)
+    backend = deepkeep.LocalBackend("default", storage)
     monkeypatch.setattr(deepkeep, "encrypt_file", lambda src, dest, cfg: shutil.copy2(src, dest))
     monkeypatch.setattr(deepkeep, "utc_now", lambda: "2026-04-07T12:00:00Z")
 
@@ -115,8 +122,8 @@ def test_snapshot_catalog_writes_latest_every_run_but_weekly_snapshots(tmp_path:
     assert len(snapshots) == 1
 
 
-def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
-    source, storage, config = repo
+def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, storage, _, config = repo
     (source / "a").mkdir()
     (source / "a" / "one.txt").write_text("one")
     (source / "a" / "two.txt").write_text("two")
@@ -153,15 +160,15 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
 
     catalog = config.parent / "catalog.sqlite"
     catalog.unlink()
-    result = CliRunner().invoke(deepkeep.cli, ["rebuild-catalog", "--config", str(config)])
+    result = CliRunner().invoke(deepkeep.cli, ["rebuild-catalog", "--config", str(config), "--backend", "glacier"])
     assert result.exit_code == 0, result.output
     assert len(db_rows(config, "SELECT * FROM files")) == 2
     assert len(db_rows(config, "SELECT * FROM file_paths")) == 2
     assert len(db_rows(config, "SELECT * FROM run_files")) == 0
 
 
-def test_dedupe_second_backup_creates_no_new_pack(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
-    source, storage, config = repo
+def test_dedupe_second_backup_creates_no_new_pack(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, storage, _, config = repo
     (source / "x.txt").write_text("same")
     runner = CliRunner()
     assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
@@ -171,8 +178,8 @@ def test_dedupe_second_backup_creates_no_new_pack(fake_crypto, repo: tuple[Path,
     assert len(db_rows(config, "SELECT * FROM run_files")) == 1
 
 
-def test_oversize_file_becomes_single_pack(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
-    source, storage, config = repo
+def test_oversize_file_becomes_single_pack(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, storage, _, config = repo
     (source / "big.bin").write_bytes(b"x" * (2 * 1024 * 1024))
     result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
     assert result.exit_code == 0, result.output
@@ -180,8 +187,8 @@ def test_oversize_file_becomes_single_pack(fake_crypto, repo: tuple[Path, Path, 
     assert len(packs) == 1
 
 
-def test_restore_skips_existing_without_force(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
-    source, _, config = repo
+def test_restore_skips_existing_without_force(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, _, _, config = repo
     (source / "keep.txt").write_text("fresh")
     runner = CliRunner()
     assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
@@ -196,8 +203,8 @@ def test_restore_skips_existing_without_force(fake_crypto, repo: tuple[Path, Pat
     assert (dest / "keep.txt").read_text() == "fresh"
 
 
-def test_restore_reapplies_original_mtime(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
-    source, _, config = repo
+def test_restore_reapplies_original_mtime(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, _, _, config = repo
     original = source / "stamp.txt"
     original.write_text("ts")
     ts = datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC).timestamp()
@@ -215,8 +222,8 @@ def test_restore_reapplies_original_mtime(fake_crypto, repo: tuple[Path, Path, P
     assert int(restored.stat().st_mtime) == int(ts)
 
 
-def test_restore_deduped_alias_path(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
-    source, _, config = repo
+def test_restore_deduped_alias_path(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, _, _, config = repo
     (source / "first.txt").write_text("same-bytes")
     (source / "alias.txt").write_text("same-bytes")
     runner = CliRunner()
@@ -230,8 +237,8 @@ def test_restore_deduped_alias_path(fake_crypto, repo: tuple[Path, Path, Path], 
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="hardlink behavior is enabled by default on Linux only")
-def test_restore_duplicates_as_hardlinks_on_linux(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
-    source, _, config = repo
+def test_restore_duplicates_as_hardlinks_on_linux(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, _, _, config = repo
     (source / "first.txt").write_text("same-bytes")
     (source / "alias.txt").write_text("same-bytes")
     runner = CliRunner()
@@ -248,8 +255,8 @@ def test_restore_duplicates_as_hardlinks_on_linux(fake_crypto, repo: tuple[Path,
     assert first.stat().st_ino == second.stat().st_ino
 
 
-def test_restore_duplicates_as_full_copies_with_no_hardlinks(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
-    source, _, config = repo
+def test_restore_duplicates_as_full_copies_with_no_hardlinks(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, _, _, config = repo
     (source / "first.txt").write_text("same-bytes")
     (source / "alias.txt").write_text("same-bytes")
     runner = CliRunner()
@@ -269,8 +276,8 @@ def test_restore_duplicates_as_full_copies_with_no_hardlinks(fake_crypto, repo: 
     assert first.stat().st_ino != second.stat().st_ino
 
 
-def test_restore_duplicates_as_pointer_files_on_windows(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path, monkeypatch) -> None:
-    source, _, config = repo
+def test_restore_duplicates_as_pointer_files_on_windows(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path, monkeypatch) -> None:
+    source, _, _, config = repo
     (source / "first.txt").write_text("same-bytes")
     (source / "alias.txt").write_text("same-bytes")
     runner = CliRunner()
@@ -289,8 +296,8 @@ def test_restore_duplicates_as_pointer_files_on_windows(fake_crypto, repo: tuple
     assert "sha256:" in pointer
 
 
-def test_restore_all_restores_everything(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
-    source, _, config = repo
+def test_restore_all_restores_everything(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, _, _, config = repo
     (source / "a").mkdir()
     (source / "a" / "one.txt").write_text("one")
     (source / "two.txt").write_text("two")
@@ -305,8 +312,8 @@ def test_restore_all_restores_everything(fake_crypto, repo: tuple[Path, Path, Pa
     assert (dest / "two.txt").read_text() == "two"
 
 
-def test_restore_requires_prefix_or_all(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
-    source, _, config = repo
+def test_restore_requires_prefix_or_all(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, _, _, config = repo
     (source / "only.txt").write_text("one")
     runner = CliRunner()
     result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
@@ -318,8 +325,8 @@ def test_restore_requires_prefix_or_all(fake_crypto, repo: tuple[Path, Path, Pat
     assert "provide at least one path prefix, or use --all" in result.output
 
 
-def test_restore_rejects_all_with_prefixes(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
-    source, _, config = repo
+def test_restore_rejects_all_with_prefixes(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, _, _, config = repo
     (source / "only.txt").write_text("one")
     runner = CliRunner()
     result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
@@ -334,8 +341,8 @@ def test_restore_rejects_all_with_prefixes(fake_crypto, repo: tuple[Path, Path, 
     assert "use either PREFIXES or --all, not both" in result.output
 
 
-def test_verify_detects_corruption(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
-    source, storage, config = repo
+def test_verify_detects_corruption(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, storage, _, config = repo
     (source / "bad.txt").write_text("good")
     runner = CliRunner()
     assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
@@ -350,14 +357,14 @@ def test_verify_detects_corruption(fake_crypto, repo: tuple[Path, Path, Path]) -
     assert result.exit_code == 1
 
 
-def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path], monkeypatch) -> None:
-    source, storage, config_path = repo
+def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path, Path], monkeypatch) -> None:
+    source, storage, _, config_path = repo
     (source / "resume.txt").write_text("resume")
     config = deepkeep.load_config(config_path)
     db = deepkeep.connect_db(config)
-    backend = deepkeep.get_backend(config)
+    backend = deepkeep.get_default_backend(config)
     run_id = "run123"
-    state, pack_dir = deepkeep.new_pack_state(config, run_id)
+    state, pack_dir = deepkeep.new_pack_state(config, run_id, backend.backend_name)
     entry = deepkeep.build_entry(source, source / "resume.txt")
     state["entries"] = [
         {
@@ -401,8 +408,8 @@ def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path], monke
     db.close()
 
 
-def test_catalog_default_lists_summary_and_runs(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
-    source, _, config = repo
+def test_catalog_default_lists_summary_and_runs(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, _, _, config = repo
     (source / "a.txt").write_text("alpha")
     (source / "b.txt").write_text("beta")
     runner = CliRunner()
@@ -418,8 +425,8 @@ def test_catalog_default_lists_summary_and_runs(fake_crypto, repo: tuple[Path, P
     assert "Run sources:" not in result.output
 
 
-def test_catalog_plaintext_is_pipe_friendly(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
-    source, _, config = repo
+def test_catalog_plaintext_is_pipe_friendly(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, _, _, config = repo
     (source / "plain.txt").write_text("hello")
     runner = CliRunner()
     result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
@@ -435,8 +442,8 @@ def test_catalog_plaintext_is_pipe_friendly(fake_crypto, repo: tuple[Path, Path,
     assert str(source) in result.output
 
 
-def test_catalog_run_shows_files_for_specific_backup(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
-    source, _, config = repo
+def test_catalog_run_shows_files_for_specific_backup(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, _, _, config = repo
     (source / "one.txt").write_text("one")
     runner = CliRunner()
     first = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
@@ -456,8 +463,8 @@ def test_catalog_run_shows_files_for_specific_backup(fake_crypto, repo: tuple[Pa
     assert "two.txt" not in result.output
 
 
-def test_catalog_files_supports_run_filter_and_plaintext(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
-    source, _, config = repo
+def test_catalog_files_supports_run_filter_and_plaintext(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, _, _, config = repo
     (source / "keep-a.txt").write_text("a")
     runner = CliRunner()
     result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
@@ -477,8 +484,8 @@ def test_catalog_files_supports_run_filter_and_plaintext(fake_crypto, repo: tupl
     assert "keep-b.txt" not in result.output
 
 
-def test_catalog_packs_and_file_detail(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
-    source, _, config = repo
+def test_catalog_packs_and_file_detail(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, _, _, config = repo
     (source / "detail.txt").write_text("detail")
     runner = CliRunner()
     result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
@@ -487,7 +494,29 @@ def test_catalog_packs_and_file_detail(fake_crypto, repo: tuple[Path, Path, Path
     result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "packs", "--plaintext"])
     assert result.exit_code == 0, result.output
     assert "PACK\t" in result.output
+    assert "\tglacier\t" in result.output
 
     result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "file", "detail.txt", "--plaintext"])
     assert result.exit_code == 0, result.output
     assert "FILE_DETAIL\tdetail.txt\t" in result.output
+    assert "\tglacier\t" in result.output
+
+
+def test_restore_can_override_backend_source(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, storage, localcopy, config = repo
+    (source / "override.txt").write_text("from-glacier-layout")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    shutil.copytree(storage / "packs", localcopy / "packs", dirs_exist_ok=True)
+    dest = tmp_path / "restore"
+    result = runner.invoke(
+        deepkeep.cli,
+        ["restore", "--config", str(config), "--backend", "localcopy", "--dest", str(dest), "--all"],
+    )
+    assert result.exit_code == 0, result.output
+    assert (dest / "override.txt").read_text() == "from-glacier-layout"
+
+    pack_backend = db_rows(config, "SELECT backend_name FROM packs")[0][0]
+    assert pack_backend == "glacier"

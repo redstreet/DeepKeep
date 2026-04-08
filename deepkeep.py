@@ -17,7 +17,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Protocol
 
 import click
 import yaml
@@ -33,6 +33,17 @@ WEEK_SECONDS = 7 * 24 * 60 * 60
 
 class DeepKeepError(RuntimeError):
     pass
+
+
+class StorageBackend(Protocol):
+    backend_name: str
+
+    def put_object(self, key: str, path: str) -> None: ...
+    def get_object(self, key: str, dest_path: str) -> None: ...
+    def exists(self, key: str) -> bool: ...
+    def list_objects(self, prefix: str) -> list[str]: ...
+    def restore_status(self, key: str) -> str: ...
+    def request_restore(self, key: str) -> str: ...
 
 
 @dataclass
@@ -161,24 +172,55 @@ def load_config(path: Path) -> dict[str, object]:
     data = yaml.safe_load(path.read_text()) or {}
     if not isinstance(data, dict):
         raise DeepKeepError("config must be a YAML mapping")
-    data.setdefault("backend", "local")
     data.setdefault("pack_size_mb", PACK_MIN_MB)
     data.setdefault("catalog_path", str(path.with_suffix(".sqlite")))
     data.setdefault("work_root", str(path.parent / ".deepkeep-work"))
     if "age_pass_entry" not in data:
         raise DeepKeepError("config must define age_pass_entry")
-    if data["backend"] == "local":
-        local = data.setdefault("local", {})
-        if "root" not in local:
-            raise DeepKeepError("config.local.root is required for local backend")
-    elif data["backend"] == "s3":
-        s3 = data.setdefault("s3", {})
-        for key in ("bucket", "prefix"):
-            if key not in s3:
-                raise DeepKeepError(f"config.s3.{key} is required for s3 backend")
-        s3.setdefault("storage_class", "DEEP_ARCHIVE")
-    else:
-        raise DeepKeepError("backend must be 'local' or 's3'")
+    if "backends" not in data:
+        legacy_backend = str(data.get("backend", "local"))
+        if legacy_backend == "local":
+            local = data.setdefault("local", {})
+            if "root" not in local:
+                raise DeepKeepError("config.local.root is required for local backend")
+            data["backends"] = {"default": {"type": "local", "root": local["root"]}}
+        elif legacy_backend == "s3":
+            s3 = data.setdefault("s3", {})
+            for key in ("bucket", "prefix"):
+                if key not in s3:
+                    raise DeepKeepError(f"config.s3.{key} is required for s3 backend")
+            s3.setdefault("storage_class", "DEEP_ARCHIVE")
+            data["backends"] = {
+                "default": {
+                    "type": "s3",
+                    "bucket": s3["bucket"],
+                    "prefix": s3["prefix"],
+                    "storage_class": s3["storage_class"],
+                }
+            }
+        else:
+            raise DeepKeepError("backend must be 'local' or 's3'")
+        data["default_backend"] = "default"
+    backends = data.get("backends")
+    if not isinstance(backends, dict) or not backends:
+        raise DeepKeepError("config.backends must be a non-empty mapping")
+    default_backend = str(data.get("default_backend", ""))
+    if not default_backend or default_backend not in backends:
+        raise DeepKeepError("config.default_backend must name one of config.backends")
+    for name, cfg in backends.items():
+        if not isinstance(cfg, dict):
+            raise DeepKeepError(f"config.backends.{name} must be a mapping")
+        backend_type = cfg.get("type")
+        if backend_type == "local":
+            if "root" not in cfg:
+                raise DeepKeepError(f"config.backends.{name}.root is required for local backend")
+        elif backend_type == "s3":
+            for key in ("bucket", "prefix"):
+                if key not in cfg:
+                    raise DeepKeepError(f"config.backends.{name}.{key} is required for s3 backend")
+            cfg.setdefault("storage_class", "DEEP_ARCHIVE")
+        else:
+            raise DeepKeepError(f"config.backends.{name}.type must be 'local' or 's3'")
     return data
 
 
@@ -239,6 +281,7 @@ def connect_db(config: dict[str, object]) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS packs (
             pack_id TEXT PRIMARY KEY,
             object_key TEXT NOT NULL,
+            backend_name TEXT NOT NULL,
             created_at TEXT NOT NULL,
             compression TEXT NOT NULL,
             encryption TEXT NOT NULL,
@@ -278,6 +321,12 @@ def connect_db(config: dict[str, object]) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_run_files_pack_id ON run_files(pack_id);
         """
     )
+    pack_columns = {row["name"] for row in db.execute("PRAGMA table_info(packs)").fetchall()}
+    if "backend_name" not in pack_columns:
+        db.execute("ALTER TABLE packs ADD COLUMN backend_name TEXT NOT NULL DEFAULT ''")
+    default_backend = get_default_backend_name(config)
+    db.execute("UPDATE packs SET backend_name = ? WHERE backend_name = '' OR backend_name IS NULL", (default_backend,))
+    db.commit()
     return db
 
 
@@ -350,7 +399,8 @@ def write_stage(path: Path, data: dict[str, object]) -> None:
 
 
 class LocalBackend:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, backend_name: str, root: Path) -> None:
+        self.backend_name = backend_name
         self.root = root
 
     def _path(self, key: str) -> Path:
@@ -387,7 +437,8 @@ class LocalBackend:
 
 
 class S3Backend:
-    def __init__(self, cfg: dict[str, object]) -> None:
+    def __init__(self, backend_name: str, cfg: dict[str, object]) -> None:
+        self.backend_name = backend_name
         self.bucket = str(cfg["bucket"])
         self.prefix = str(cfg["prefix"]).strip("/")
         self.storage_class = str(cfg.get("storage_class", "DEEP_ARCHIVE"))
@@ -462,10 +513,19 @@ class S3Backend:
         return "pending"
 
 
-def get_backend(config: dict[str, object]) -> LocalBackend | S3Backend:
-    if config["backend"] == "local":
-        return LocalBackend(Path(config["local"]["root"]))
-    return S3Backend(config["s3"])
+def get_backend(config: dict[str, object], backend_name: str) -> StorageBackend:
+    cfg = config["backends"][backend_name]
+    if cfg["type"] == "local":
+        return LocalBackend(backend_name, Path(cfg["root"]))
+    return S3Backend(backend_name, cfg)
+
+
+def get_default_backend_name(config: dict[str, object]) -> str:
+    return str(config["default_backend"])
+
+
+def get_default_backend(config: dict[str, object]) -> StorageBackend:
+    return get_backend(config, get_default_backend_name(config))
 
 
 def stage_root(config: dict[str, object]) -> Path:
@@ -474,7 +534,7 @@ def stage_root(config: dict[str, object]) -> Path:
     return root
 
 
-def snapshot_catalog(config: dict[str, object], backend: LocalBackend | S3Backend) -> None:
+def snapshot_catalog(config: dict[str, object], backend: StorageBackend) -> None:
     catalog = Path(str(config["catalog_path"]))
     if not catalog.exists():
         return
@@ -490,10 +550,11 @@ def snapshot_catalog(config: dict[str, object], backend: LocalBackend | S3Backen
 
 def commit_pack(db: sqlite3.Connection, stage: dict[str, object]) -> None:
     db.execute(
-        "INSERT OR REPLACE INTO packs(pack_id, object_key, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO packs(pack_id, object_key, backend_name, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             stage["pack_id"],
             stage["object_key"],
+            stage["backend_name"],
             stage["created_at"],
             "off",
             "age",
@@ -517,13 +578,14 @@ def commit_pack(db: sqlite3.Connection, stage: dict[str, object]) -> None:
     db.commit()
 
 
-def resume_pending(config: dict[str, object], db: sqlite3.Connection, backend: LocalBackend | S3Backend) -> int:
+def resume_pending(config: dict[str, object], db: sqlite3.Connection, backend: StorageBackend) -> int:
     committed = 0
     for state_path in sorted(stage_root(config).glob("packs/*/state.json")):
         stage = read_stage(state_path)
         enc = Path(stage["enc_path"])
+        stage_backend = get_backend(config, str(stage.get("backend_name", get_default_backend_name(config))))
         if stage["status"] == "ENCRYPTED":
-            backend.put_object(stage["object_key"], str(enc))
+            stage_backend.put_object(stage["object_key"], str(enc))
             stage["status"] = "UPLOADED"
             write_stage(state_path, stage)
         if stage["status"] == "UPLOADED":
@@ -535,7 +597,7 @@ def resume_pending(config: dict[str, object], db: sqlite3.Connection, backend: L
     return committed
 
 
-def new_pack_state(config: dict[str, object], run_id: str) -> tuple[dict[str, object], Path]:
+def new_pack_state(config: dict[str, object], run_id: str, backend_name: str) -> tuple[dict[str, object], Path]:
     pack_id = uuid.uuid4().hex[:12]
     created_at = utc_now()
     object_key = pack_object_key(pack_id, created_at)
@@ -544,6 +606,7 @@ def new_pack_state(config: dict[str, object], run_id: str) -> tuple[dict[str, ob
     state = {
         "pack_id": pack_id,
         "run_id": run_id,
+        "backend_name": backend_name,
         "created_at": created_at,
         "object_key": object_key,
         "status": "BUILDING",
@@ -554,7 +617,7 @@ def new_pack_state(config: dict[str, object], run_id: str) -> tuple[dict[str, ob
     return state, pack_dir
 
 
-def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: LocalBackend | S3Backend, state: dict[str, object]) -> None:
+def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: StorageBackend, state: dict[str, object]) -> None:
     entries = [
         Entry(
             source=Path(item["source"]),
@@ -583,7 +646,7 @@ def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: LocalB
 
 def backup_source(config: dict[str, object], source: Path, dry_run: bool = False) -> dict[str, int]:
     db = connect_db(config)
-    backend = get_backend(config)
+    backend = get_default_backend(config)
     resume_pending(config, db, backend)
     run_id = uuid.uuid4().hex[:12]
     started = utc_now()
@@ -594,7 +657,8 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
     db.commit()
     stats = {"files_scanned": 0, "files_new": 0, "files_deduped": 0, "bytes_new": 0, "bytes_total_scanned": 0, "packs_created": 0}
     target = int(config["pack_size_mb"]) * 1024 * 1024
-    state, _ = new_pack_state(config, run_id)
+    backend_name = backend.backend_name
+    state, _ = new_pack_state(config, run_id, backend_name)
     current_size = 0
     run_hashes: set[str] = set()
     for path in iter_files(source):
@@ -623,7 +687,7 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
             stats["packs_created"] += 1
             if not dry_run:
                 seal_pack(config, db, backend, state)
-            state, _ = new_pack_state(config, run_id)
+            state, _ = new_pack_state(config, run_id, backend_name)
             current_size = 0
     if state["entries"]:
         stats["packs_created"] += 1
@@ -655,7 +719,7 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
     return stats
 
 
-def fetch_pack(config: dict[str, object], backend: LocalBackend | S3Backend, object_key: str, workdir: Path) -> Path:
+def fetch_pack(config: dict[str, object], backend: StorageBackend, object_key: str, workdir: Path) -> Path:
     enc_path = workdir / Path(object_key).name
     tar_path = workdir / enc_path.name.removesuffix(".age")
     backend.get_object(object_key, str(enc_path))
@@ -678,11 +742,12 @@ def restore_prefixes(
     force: bool = False,
     restore_all: bool = False,
     no_hardlinks: bool = False,
+    backend_name: str | None = None,
 ) -> tuple[int, int]:
     db = connect_db(config)
     rows = db.execute(
         """
-        SELECT fp.path, fp.mtime, fp.sha256, f.pack_id, f.tar_path, p.object_key
+        SELECT fp.path, fp.mtime, fp.sha256, f.pack_id, f.tar_path, p.object_key, p.backend_name
         FROM file_paths fp
         JOIN files f ON f.sha256 = fp.sha256
         JOIN packs p ON p.pack_id = f.pack_id
@@ -692,18 +757,19 @@ def restore_prefixes(
     matches = rows if restore_all else [row for row in rows if any(row["path"].startswith(prefix) for prefix in prefixes)]
     if not matches:
         return 0, 0
-    by_pack: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    by_pack: dict[tuple[str, str], list[sqlite3.Row]] = defaultdict(list)
     for row in matches:
-        by_pack[row["pack_id"]].append(row)
-    backend = get_backend(config)
+        source_backend = backend_name or row["backend_name"]
+        by_pack[(source_backend, row["pack_id"])].append(row)
     restored = 0
     pending = 0
     canonical_by_hash: dict[str, tuple[Path, str]] = {}
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         for rows_in_pack in by_pack.values():
+            backend = get_backend(config, rows_in_pack[0]["backend_name"] if backend_name is None else backend_name)
             object_key = rows_in_pack[0]["object_key"]
-            status = backend.request_restore(object_key) if config["backend"] == "s3" else "ready"
+            status = backend.request_restore(object_key)
             if status != "ready":
                 pending += 1
                 continue
@@ -744,12 +810,12 @@ def restore_prefixes(
     return restored, pending
 
 
-def verify_pack(config: dict[str, object], pack_id: str) -> list[str]:
+def verify_pack(config: dict[str, object], pack_id: str, backend_name: str | None = None) -> list[str]:
     db = connect_db(config)
-    row = db.execute("SELECT object_key FROM packs WHERE pack_id = ?", (pack_id,)).fetchone()
+    row = db.execute("SELECT object_key, backend_name FROM packs WHERE pack_id = ?", (pack_id,)).fetchone()
     if row is None:
         raise DeepKeepError(f"unknown pack_id: {pack_id}")
-    backend = get_backend(config)
+    backend = get_backend(config, backend_name or row["backend_name"])
     issues: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
         tar_path = fetch_pack(config, backend, row["object_key"], Path(tmp))
@@ -766,9 +832,9 @@ def verify_pack(config: dict[str, object], pack_id: str) -> list[str]:
     return issues
 
 
-def rebuild_catalog(config: dict[str, object]) -> int:
+def rebuild_catalog(config: dict[str, object], backend_name: str) -> int:
     db = connect_db(config)
-    backend = get_backend(config)
+    backend = get_backend(config, backend_name)
     db.execute("DELETE FROM file_paths")
     db.execute("DELETE FROM files")
     db.execute("DELETE FROM packs")
@@ -783,8 +849,8 @@ def rebuild_catalog(config: dict[str, object]) -> int:
             pack_id = name.split("pack-")[-1].split(".tar.age")[0]
             created_at = str(manifest.get("created_at", utc_now()))
             db.execute(
-                "INSERT OR REPLACE INTO packs(pack_id, object_key, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (pack_id, key, created_at, "off", "age", 1, "rebuild"),
+                "INSERT OR REPLACE INTO packs(pack_id, object_key, backend_name, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (pack_id, key, backend_name, created_at, "off", "age", 1, "rebuild"),
             )
             for item in manifest["files"]:
                 db.execute(
@@ -845,11 +911,11 @@ def catalog_run_detail(config: dict[str, object], run_id: str) -> tuple[sqlite3.
     ).fetchone()
     pack_rows = db.execute(
         """
-        SELECT p.pack_id, p.created_at, p.object_key, p.run_id, COUNT(f.sha256) AS file_count, COALESCE(SUM(f.size), 0) AS total_bytes
+        SELECT p.pack_id, p.created_at, p.object_key, p.backend_name, p.run_id, COUNT(f.sha256) AS file_count, COALESCE(SUM(f.size), 0) AS total_bytes
         FROM packs p
         LEFT JOIN files f ON f.pack_id = p.pack_id
         WHERE p.run_id = ?
-        GROUP BY p.pack_id, p.created_at, p.object_key, p.run_id
+        GROUP BY p.pack_id, p.created_at, p.object_key, p.backend_name, p.run_id
         ORDER BY p.created_at, p.pack_id
         """,
         (run_id,),
@@ -900,10 +966,10 @@ def catalog_packs(config: dict[str, object]) -> list[sqlite3.Row]:
     db = connect_db(config)
     rows = db.execute(
         """
-        SELECT p.pack_id, p.created_at, p.object_key, p.run_id, COUNT(f.sha256) AS file_count, COALESCE(SUM(f.size), 0) AS total_bytes
+        SELECT p.pack_id, p.created_at, p.object_key, p.backend_name, p.run_id, COUNT(f.sha256) AS file_count, COALESCE(SUM(f.size), 0) AS total_bytes
         FROM packs p
         LEFT JOIN files f ON f.pack_id = p.pack_id
-        GROUP BY p.pack_id, p.created_at, p.object_key, p.run_id
+        GROUP BY p.pack_id, p.created_at, p.object_key, p.backend_name, p.run_id
         ORDER BY p.created_at DESC, p.pack_id DESC
         """
     ).fetchall()
@@ -915,9 +981,10 @@ def catalog_file_detail(config: dict[str, object], path: str) -> sqlite3.Row | N
     db = connect_db(config)
     row = db.execute(
         """
-        SELECT fp.path, f.size, fp.mtime, fp.sha256, f.pack_id, f.tar_path, rf.run_id
+        SELECT fp.path, f.size, fp.mtime, fp.sha256, f.pack_id, f.tar_path, p.backend_name, rf.run_id
         FROM file_paths fp
         JOIN files f ON f.sha256 = fp.sha256
+        JOIN packs p ON p.pack_id = f.pack_id
         LEFT JOIN run_files rf ON rf.path = fp.path AND rf.sha256 = fp.sha256
         WHERE fp.path = ?
         """,
@@ -1013,7 +1080,7 @@ def render_packs(rows: list[sqlite3.Row], plaintext: bool, title: str = "Packs")
     if plaintext:
         for row in rows:
             click.echo(
-                f"PACK\t{row['pack_id']}\t{row['created_at']}\t{row['object_key']}\t{row['run_id']}\t{row['file_count']}\t{row['total_bytes']}"
+                f"PACK\t{row['pack_id']}\t{row['created_at']}\t{row['object_key']}\t{row['backend_name']}\t{row['run_id']}\t{row['file_count']}\t{row['total_bytes']}"
             )
         return
     if not rows:
@@ -1022,6 +1089,7 @@ def render_packs(rows: list[sqlite3.Row], plaintext: bool, title: str = "Packs")
     table = Table(title=title)
     table.add_column("Pack ID")
     table.add_column("Created")
+    table.add_column("Backend")
     table.add_column("Run")
     table.add_column("Files", justify="right")
     table.add_column("Bytes", justify="right")
@@ -1030,6 +1098,7 @@ def render_packs(rows: list[sqlite3.Row], plaintext: bool, title: str = "Packs")
         table.add_row(
             row["pack_id"],
             row["created_at"],
+            row["backend_name"],
             row["run_id"],
             str(row["file_count"]),
             str(row["total_bytes"]),
@@ -1044,7 +1113,7 @@ def render_file_detail(row: sqlite3.Row | None, plaintext: bool) -> None:
         return
     if plaintext:
         click.echo(
-            f"FILE_DETAIL\t{row['path']}\t{row['size']}\t{row['mtime'] or ''}\t{row['sha256']}\t{row['pack_id']}\t{row['tar_path']}\t{row['run_id'] or ''}"
+            f"FILE_DETAIL\t{row['path']}\t{row['size']}\t{row['mtime'] or ''}\t{row['sha256']}\t{row['pack_id']}\t{row['tar_path']}\t{row['backend_name']}\t{row['run_id'] or ''}"
         )
         return
     table = Table(title="File Detail")
@@ -1057,6 +1126,7 @@ def render_file_detail(row: sqlite3.Row | None, plaintext: bool) -> None:
         ("SHA256", row["sha256"]),
         ("Pack", row["pack_id"]),
         ("Tar Path", row["tar_path"]),
+        ("Backend", row["backend_name"]),
         ("Run", row["run_id"] or ""),
     ):
         table.add_row(key, str(value))
@@ -1092,16 +1162,27 @@ def backup(config_path: Path, dry_run: bool, source: Path) -> None:
 @option_config
 @click.option("--dest", type=click.Path(path_type=Path), required=True)
 @click.option("--all", "restore_all", is_flag=True, help="Restore the entire catalog.")
+@click.option("--backend", "restore_backend", help="Override the backend/profile used to fetch packs.")
 @click.option("--no-hardlinks", is_flag=True, help="Do not restore duplicate files as hardlinks on Linux.")
 @click.option("--force", is_flag=True, help="Overwrite files already present at the destination.")
 @click.argument("prefixes", nargs=-1)
-def restore_cmd(config_path: Path, dest: Path, restore_all: bool, no_hardlinks: bool, force: bool, prefixes: tuple[str, ...]) -> None:
+def restore_cmd(
+    config_path: Path,
+    dest: Path,
+    restore_all: bool,
+    restore_backend: str | None,
+    no_hardlinks: bool,
+    force: bool,
+    prefixes: tuple[str, ...],
+) -> None:
     """Restore archived files whose original paths match PREFIXES."""
     if restore_all and prefixes:
         raise click.UsageError("use either PREFIXES or --all, not both")
     if not restore_all and not prefixes:
         raise click.UsageError("provide at least one path prefix, or use --all")
     config = load_config(config_path)
+    if restore_backend is not None:
+        get_backend(config, restore_backend)
     restored, pending = restore_prefixes(
         config,
         prefixes,
@@ -1109,6 +1190,7 @@ def restore_cmd(config_path: Path, dest: Path, restore_all: bool, no_hardlinks: 
         force=force,
         restore_all=restore_all,
         no_hardlinks=no_hardlinks,
+        backend_name=restore_backend,
     )
     console.print(f"restored: {restored}")
     if pending:
@@ -1117,11 +1199,14 @@ def restore_cmd(config_path: Path, dest: Path, restore_all: bool, no_hardlinks: 
 
 @cli.command("verify-pack")
 @option_config
+@click.option("--backend", "verify_backend", help="Override the backend/profile used to fetch the pack.")
 @click.argument("pack_id")
-def verify_pack_cmd(config_path: Path, pack_id: str) -> None:
+def verify_pack_cmd(config_path: Path, verify_backend: str | None, pack_id: str) -> None:
     """Verify MANIFEST.json entries against pack contents."""
     config = load_config(config_path)
-    issues = verify_pack(config, pack_id)
+    if verify_backend is not None:
+        get_backend(config, verify_backend)
+    issues = verify_pack(config, pack_id, backend_name=verify_backend)
     if issues:
         for issue in issues:
             console.print(f"[red]{issue}[/red]")
@@ -1131,10 +1216,12 @@ def verify_pack_cmd(config_path: Path, pack_id: str) -> None:
 
 @cli.command("rebuild-catalog")
 @option_config
-def rebuild_catalog_cmd(config_path: Path) -> None:
+@click.option("--backend", "rebuild_backend", required=True, help="Backend/profile to scan for packs.")
+def rebuild_catalog_cmd(config_path: Path, rebuild_backend: str) -> None:
     """Rebuild SQLite from embedded manifests."""
     config = load_config(config_path)
-    count = rebuild_catalog(config)
+    get_backend(config, rebuild_backend)
+    count = rebuild_catalog(config, rebuild_backend)
     console.print(f"rebuilt catalog from {count} pack(s)")
 
 
