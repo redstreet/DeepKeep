@@ -70,6 +70,51 @@ def test_load_config_requires_age_pass_entry(tmp_path: Path) -> None:
         deepkeep.load_config(config)
 
 
+def test_should_write_catalog_snapshot_weekly_policy() -> None:
+    now = "2026-04-07T12:00:00Z"
+    assert deepkeep.should_write_catalog_snapshot(now, []) is True
+    assert deepkeep.should_write_catalog_snapshot(
+        now,
+        ["catalog/snapshots/catalog-20260401T120000Z.sqlite.age"],
+    ) is False
+    assert deepkeep.should_write_catalog_snapshot(
+        now,
+        ["catalog/snapshots/catalog-20260331T115959Z.sqlite.age"],
+    ) is True
+    assert deepkeep.should_write_catalog_snapshot(
+        now,
+        ["catalog/snapshots/not-a-timestamp.sqlite.age"],
+    ) is True
+
+
+def test_snapshot_catalog_writes_latest_every_run_but_weekly_snapshots(tmp_path: Path, monkeypatch) -> None:
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    catalog = tmp_path / "catalog.sqlite"
+    catalog.write_text("catalog")
+    config = {
+        "catalog_path": str(catalog),
+        "work_root": str(tmp_path / ".work"),
+        "backend": "local",
+        "local": {"root": str(storage)},
+        "age_pass_entry": "backups/deepkeep",
+    }
+    backend = deepkeep.LocalBackend(storage)
+    monkeypatch.setattr(deepkeep, "encrypt_file", lambda src, dest, cfg: shutil.copy2(src, dest))
+    monkeypatch.setattr(deepkeep, "utc_now", lambda: "2026-04-07T12:00:00Z")
+
+    deepkeep.snapshot_catalog(config, backend)
+    latest = storage / "catalog" / "latest.sqlite.age"
+    snapshots = sorted((storage / "catalog" / "snapshots").glob("*.age"))
+    assert latest.exists()
+    assert len(snapshots) == 1
+
+    deepkeep.snapshot_catalog(config, backend)
+    snapshots = sorted((storage / "catalog" / "snapshots").glob("*.age"))
+    assert latest.exists()
+    assert len(snapshots) == 1
+
+
 def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
     source, storage, config = repo
     (source / "a").mkdir()

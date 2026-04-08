@@ -27,6 +27,8 @@ from rich.table import Table
 console = Console()
 ISO = "%Y-%m-%dT%H:%M:%SZ"
 PACK_MIN_MB = 512
+SNAPSHOT_NAME = "catalog/snapshots/catalog-"
+WEEK_SECONDS = 7 * 24 * 60 * 60
 
 
 class DeepKeepError(RuntimeError):
@@ -58,6 +60,28 @@ def utc_now() -> str:
 
 def parse_utc(value: str) -> datetime:
     return datetime.strptime(value, ISO).replace(tzinfo=UTC)
+
+
+def parse_snapshot_key(key: str) -> datetime | None:
+    prefix = SNAPSHOT_NAME
+    suffix = ".sqlite.age"
+    if not key.startswith(prefix) or not key.endswith(suffix):
+        return None
+    raw = key[len(prefix) : -len(suffix)]
+    if len(raw) != 16 or not raw.endswith("Z"):
+        return None
+    try:
+        return datetime.strptime(raw, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def should_write_catalog_snapshot(now: str, snapshot_keys: list[str]) -> bool:
+    current = parse_utc(now)
+    latest = max((parsed for key in snapshot_keys if (parsed := parse_snapshot_key(key)) is not None), default=None)
+    if latest is None:
+        return True
+    return (current - latest).total_seconds() >= WEEK_SECONDS
 
 
 def is_linux_platform() -> bool:
@@ -460,7 +484,8 @@ def snapshot_catalog(config: dict[str, object], backend: LocalBackend | S3Backen
         encrypt_file(catalog, enc, config)
         latest_key, snap_key = catalog_object_keys(ts)
         backend.put_object(latest_key, str(enc))
-        backend.put_object(snap_key, str(enc))
+        if should_write_catalog_snapshot(ts, backend.list_objects("catalog/snapshots")):
+            backend.put_object(snap_key, str(enc))
 
 
 def commit_pack(db: sqlite3.Connection, stage: dict[str, object]) -> None:
