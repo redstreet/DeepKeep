@@ -9,6 +9,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import tarfile
 import tempfile
 import uuid
@@ -57,6 +58,46 @@ def utc_now() -> str:
 
 def parse_utc(value: str) -> datetime:
     return datetime.strptime(value, ISO).replace(tzinfo=UTC)
+
+
+def is_linux_platform() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def is_windows_platform() -> bool:
+    return os.name == "nt"
+
+
+def apply_mtime(path: Path, mtime: str | None) -> None:
+    if not mtime:
+        return
+    ts = parse_utc(str(mtime)).timestamp()
+    os.utime(path, (ts, ts))
+
+
+def remove_existing_target(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def write_pointer_file(target: Path, canonical_rel: str, canonical_target: Path, sha256: str, mtime: str | None) -> None:
+    target.write_text(
+        "\n".join(
+            [
+                "deepkeep duplicate placeholder",
+                f"original: {canonical_rel}",
+                f"resolved_to: {canonical_target}",
+                f"sha256: {sha256}",
+            ]
+        )
+        + "\n"
+    )
+    apply_mtime(target, mtime)
+
+
+def write_full_copy(target: Path, canonical_target: Path, mtime: str | None) -> None:
+    shutil.copyfile(canonical_target, target)
+    apply_mtime(target, mtime)
 
 
 def sha256_file(path: Path) -> str:
@@ -617,7 +658,14 @@ def read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
             return json.load(fh)
 
 
-def restore_prefixes(config: dict[str, object], prefixes: tuple[str, ...], dest: Path, force: bool = False, restore_all: bool = False) -> tuple[int, int]:
+def restore_prefixes(
+    config: dict[str, object],
+    prefixes: tuple[str, ...],
+    dest: Path,
+    force: bool = False,
+    restore_all: bool = False,
+    no_hardlinks: bool = False,
+) -> tuple[int, int]:
     db = connect_db(config)
     rows = db.execute(
         """
@@ -637,6 +685,7 @@ def restore_prefixes(config: dict[str, object], prefixes: tuple[str, ...], dest:
     backend = get_backend(config)
     restored = 0
     pending = 0
+    canonical_by_hash: dict[str, tuple[Path, str]] = {}
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         for rows_in_pack in by_pack.values():
@@ -652,18 +701,32 @@ def restore_prefixes(config: dict[str, object], prefixes: tuple[str, ...], dest:
                     target = dest / rel
                     if target.exists() and not force:
                         continue
-                    member = tf.extractfile(row["tar_path"])
-                    if member is None:
-                        raise DeepKeepError(f"missing member in pack: {row['tar_path']}")
-                    data = member.read()
-                    digest = hashlib.sha256(data).hexdigest()
-                    if digest != row["sha256"]:
-                        raise DeepKeepError(f"hash mismatch while restoring {rel}")
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(data)
-                    if row["mtime"]:
-                        ts = parse_utc(str(row["mtime"])).timestamp()
-                        os.utime(target, (ts, ts))
+                    if force:
+                        remove_existing_target(target)
+                    canonical = canonical_by_hash.get(row["sha256"])
+                    if canonical is None:
+                        member = tf.extractfile(row["tar_path"])
+                        if member is None:
+                            raise DeepKeepError(f"missing member in pack: {row['tar_path']}")
+                        data = member.read()
+                        digest = hashlib.sha256(data).hexdigest()
+                        if digest != row["sha256"]:
+                            raise DeepKeepError(f"hash mismatch while restoring {rel}")
+                        target.write_bytes(data)
+                        apply_mtime(target, row["mtime"])
+                        canonical_by_hash[row["sha256"]] = (target, rel)
+                    else:
+                        canonical_target, canonical_rel = canonical
+                        if is_windows_platform():
+                            write_pointer_file(target, canonical_rel, canonical_target, row["sha256"], row["mtime"])
+                        elif is_linux_platform() and not no_hardlinks:
+                            try:
+                                os.link(canonical_target, target)
+                            except OSError:
+                                write_full_copy(target, canonical_target, row["mtime"])
+                        else:
+                            write_full_copy(target, canonical_target, row["mtime"])
                     restored += 1
     return restored, pending
 
@@ -1016,16 +1079,24 @@ def backup(config_path: Path, dry_run: bool, source: Path) -> None:
 @option_config
 @click.option("--dest", type=click.Path(path_type=Path), required=True)
 @click.option("--all", "restore_all", is_flag=True, help="Restore the entire catalog.")
+@click.option("--no-hardlinks", is_flag=True, help="Do not restore duplicate files as hardlinks on Linux.")
 @click.option("--force", is_flag=True, help="Overwrite files already present at the destination.")
 @click.argument("prefixes", nargs=-1)
-def restore_cmd(config_path: Path, dest: Path, restore_all: bool, force: bool, prefixes: tuple[str, ...]) -> None:
+def restore_cmd(config_path: Path, dest: Path, restore_all: bool, no_hardlinks: bool, force: bool, prefixes: tuple[str, ...]) -> None:
     """Restore archived files whose original paths match PREFIXES."""
     if restore_all and prefixes:
         raise click.UsageError("use either PREFIXES or --all, not both")
     if not restore_all and not prefixes:
         raise click.UsageError("provide at least one path prefix, or use --all")
     config = load_config(config_path)
-    restored, pending = restore_prefixes(config, prefixes, dest.resolve(), force=force, restore_all=restore_all)
+    restored, pending = restore_prefixes(
+        config,
+        prefixes,
+        dest.resolve(),
+        force=force,
+        restore_all=restore_all,
+        no_hardlinks=no_hardlinks,
+    )
     console.print(f"restored: {restored}")
     if pending:
         console.print(f"packs pending glacier restore: {pending}")

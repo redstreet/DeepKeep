@@ -4,6 +4,7 @@ import os
 import shutil
 import socket
 import sqlite3
+import sys
 import tarfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -163,6 +164,66 @@ def test_restore_deduped_alias_path(fake_crypto, repo: tuple[Path, Path, Path], 
     result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "alias"])
     assert result.exit_code == 0, result.output
     assert (dest / "alias.txt").read_text() == "same-bytes"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="hardlink behavior is enabled by default on Linux only")
+def test_restore_duplicates_as_hardlinks_on_linux(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
+    source, _, config = repo
+    (source / "first.txt").write_text("same-bytes")
+    (source / "alias.txt").write_text("same-bytes")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    dest = tmp_path / "restore"
+    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "--all"])
+    assert result.exit_code == 0, result.output
+    first = dest / "alias.txt"
+    second = dest / "first.txt"
+    assert first.read_text() == "same-bytes"
+    assert second.read_text() == "same-bytes"
+    assert first.stat().st_ino == second.stat().st_ino
+
+
+def test_restore_duplicates_as_full_copies_with_no_hardlinks(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
+    source, _, config = repo
+    (source / "first.txt").write_text("same-bytes")
+    (source / "alias.txt").write_text("same-bytes")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    dest = tmp_path / "restore"
+    result = runner.invoke(
+        deepkeep.cli,
+        ["restore", "--config", str(config), "--dest", str(dest), "--all", "--no-hardlinks"],
+    )
+    assert result.exit_code == 0, result.output
+    first = dest / "alias.txt"
+    second = dest / "first.txt"
+    assert first.read_text() == "same-bytes"
+    assert second.read_text() == "same-bytes"
+    assert first.stat().st_ino != second.stat().st_ino
+
+
+def test_restore_duplicates_as_pointer_files_on_windows(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path, monkeypatch) -> None:
+    source, _, config = repo
+    (source / "first.txt").write_text("same-bytes")
+    (source / "alias.txt").write_text("same-bytes")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    monkeypatch.setattr(deepkeep, "is_windows_platform", lambda: True)
+    monkeypatch.setattr(deepkeep, "is_linux_platform", lambda: False)
+    dest = tmp_path / "restore"
+    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "--all"])
+    assert result.exit_code == 0, result.output
+    assert (dest / "alias.txt").read_text() == "same-bytes"
+    pointer = (dest / "first.txt").read_text()
+    assert "deepkeep duplicate placeholder" in pointer
+    assert "original: alias.txt" in pointer
+    assert "sha256:" in pointer
 
 
 def test_restore_all_restores_everything(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
