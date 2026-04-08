@@ -151,6 +151,20 @@ def test_restore_reapplies_original_mtime(fake_crypto, repo: tuple[Path, Path, P
     assert int(restored.stat().st_mtime) == int(ts)
 
 
+def test_restore_deduped_alias_path(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
+    source, _, config = repo
+    (source / "first.txt").write_text("same-bytes")
+    (source / "alias.txt").write_text("same-bytes")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    dest = tmp_path / "restore"
+    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "alias"])
+    assert result.exit_code == 0, result.output
+    assert (dest / "alias.txt").read_text() == "same-bytes"
+
+
 def test_restore_all_restores_everything(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
     source, _, config = repo
     (source / "a").mkdir()

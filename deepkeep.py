@@ -621,7 +621,7 @@ def restore_prefixes(config: dict[str, object], prefixes: tuple[str, ...], dest:
     db = connect_db(config)
     rows = db.execute(
         """
-        SELECT fp.path, fp.sha256, f.pack_id, p.object_key
+        SELECT fp.path, fp.mtime, fp.sha256, f.pack_id, f.tar_path, p.object_key
         FROM file_paths fp
         JOIN files f ON f.sha256 = fp.sha256
         JOIN packs p ON p.pack_id = f.pack_id
@@ -646,26 +646,23 @@ def restore_prefixes(config: dict[str, object], prefixes: tuple[str, ...], dest:
                 pending += 1
                 continue
             tar_path = fetch_pack(config, backend, object_key, tmpdir)
-            manifest = read_manifest_from_tar(tar_path)
-            manifest_by_path = {item["original_path"]: item for item in manifest["files"]}
             with tarfile.open(tar_path) as tf:
                 for row in rows_in_pack:
                     rel = row["path"]
                     target = dest / rel
                     if target.exists() and not force:
                         continue
-                    info = manifest_by_path[rel]
-                    member = tf.extractfile(info["member_path"])
+                    member = tf.extractfile(row["tar_path"])
                     if member is None:
-                        raise DeepKeepError(f"missing member in pack: {info['member_path']}")
+                        raise DeepKeepError(f"missing member in pack: {row['tar_path']}")
                     data = member.read()
                     digest = hashlib.sha256(data).hexdigest()
-                    if digest != info["sha256"]:
+                    if digest != row["sha256"]:
                         raise DeepKeepError(f"hash mismatch while restoring {rel}")
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)
-                    if info.get("mtime"):
-                        ts = parse_utc(str(info["mtime"])).timestamp()
+                    if row["mtime"]:
+                        ts = parse_utc(str(row["mtime"])).timestamp()
                         os.utime(target, (ts, ts))
                     restored += 1
     return restored, pending
