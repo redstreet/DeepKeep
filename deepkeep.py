@@ -293,8 +293,18 @@ def connect_db(config: dict[str, object]) -> sqlite3.Connection:
             pack_id TEXT,
             PRIMARY KEY (run_id, path)
         );
+        CREATE TABLE IF NOT EXISTS path_versions (
+            path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            mtime TEXT,
+            run_id TEXT NOT NULL,
+            pack_id TEXT,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, path)
+        );
         CREATE INDEX IF NOT EXISTS idx_run_files_run_id ON run_files(run_id);
         CREATE INDEX IF NOT EXISTS idx_run_files_pack_id ON run_files(pack_id);
+        CREATE INDEX IF NOT EXISTS idx_path_versions_path_recorded ON path_versions(path, recorded_at);
         """
     )
     pack_columns = {row["name"] for row in db.execute("PRAGMA table_info(packs)").fetchall()}
@@ -313,8 +323,36 @@ def upsert_file_path(db: sqlite3.Connection, entry: Entry) -> None:
     )
 
 
+def current_path_row(db: sqlite3.Connection, path: str) -> sqlite3.Row | None:
+    return db.execute("SELECT sha256, mtime FROM file_paths WHERE path = ?", (path,)).fetchone()
+
+
 def has_hash(db: sqlite3.Connection, sha256: str) -> bool:
     return db.execute("SELECT 1 FROM files WHERE sha256 = ?", (sha256,)).fetchone() is not None
+
+
+def lookup_file_blob(db: sqlite3.Connection, sha256: str) -> sqlite3.Row | None:
+    return db.execute("SELECT pack_id, size FROM files WHERE sha256 = ?", (sha256,)).fetchone()
+
+
+def should_record_path_version(previous: sqlite3.Row | None, entry: Entry) -> bool:
+    return previous is None or previous["sha256"] != entry.sha256
+
+
+def record_path_version(
+    db: sqlite3.Connection,
+    *,
+    path: str,
+    sha256: str,
+    mtime: str | None,
+    run_id: str,
+    recorded_at: str,
+    pack_id: str | None,
+) -> None:
+    db.execute(
+        "INSERT OR REPLACE INTO path_versions(path, sha256, mtime, run_id, pack_id, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (path, sha256, mtime, run_id, pack_id, recorded_at),
+    )
 
 
 def iter_files(source: Path) -> Iterable[Path]:
@@ -551,6 +589,15 @@ def commit_pack(db: sqlite3.Connection, stage: dict[str, object]) -> None:
             "INSERT OR REPLACE INTO run_files(run_id, path, sha256, size, mtime, pack_id) VALUES (?, ?, ?, ?, ?, ?)",
             (stage["run_id"], item["original_path"], item["sha256"], item["size"], item.get("mtime"), stage["pack_id"]),
         )
+        record_path_version(
+            db,
+            path=item["original_path"],
+            sha256=item["sha256"],
+            mtime=item.get("mtime"),
+            run_id=stage["run_id"],
+            recorded_at=stage["created_at"],
+            pack_id=stage["pack_id"],
+        )
     db.commit()
 
 
@@ -639,11 +686,23 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
     run_hashes: set[str] = set()
     for path in iter_files(source):
         entry = build_entry(source, path)
+        previous = current_path_row(db, entry.rel_path)
         stats["files_scanned"] += 1
         stats["bytes_total_scanned"] += entry.size
         upsert_file_path(db, entry)
         if entry.sha256 in run_hashes or has_hash(db, entry.sha256):
             stats["files_deduped"] += 1
+            if should_record_path_version(previous, entry):
+                blob = lookup_file_blob(db, entry.sha256)
+                record_path_version(
+                    db,
+                    path=entry.rel_path,
+                    sha256=entry.sha256,
+                    mtime=entry.mtime,
+                    run_id=run_id,
+                    recorded_at=started,
+                    pack_id=None if blob is None else blob["pack_id"],
+                )
             continue
         stats["files_new"] += 1
         stats["bytes_new"] += entry.size
@@ -719,17 +778,40 @@ def restore_prefixes(
     restore_all: bool = False,
     no_hardlinks: bool = False,
     backend_name: str | None = None,
+    as_of_run: str | None = None,
 ) -> tuple[int, int]:
     db = connect_db(config)
-    rows = db.execute(
-        """
-        SELECT fp.path, fp.mtime, fp.sha256, f.pack_id, f.tar_path, p.object_key, p.backend_name
-        FROM file_paths fp
-        JOIN files f ON f.sha256 = fp.sha256
-        JOIN packs p ON p.pack_id = f.pack_id
-        ORDER BY fp.path
-        """
-    ).fetchall()
+    if as_of_run is None:
+        rows = db.execute(
+            """
+            SELECT fp.path, fp.mtime, fp.sha256, f.pack_id, f.tar_path, p.object_key, p.backend_name
+            FROM file_paths fp
+            JOIN files f ON f.sha256 = fp.sha256
+            JOIN packs p ON p.pack_id = f.pack_id
+            ORDER BY fp.path
+            """
+        ).fetchall()
+    else:
+        target_run = db.execute("SELECT started_at FROM backup_runs WHERE run_id = ?", (as_of_run,)).fetchone()
+        if target_run is None:
+            raise DeepKeepError(f"unknown run_id: {as_of_run}")
+        rows = db.execute(
+            """
+            SELECT pv.path, pv.mtime, pv.sha256, f.pack_id, f.tar_path, p.object_key, p.backend_name
+            FROM path_versions pv
+            JOIN backup_runs br ON br.run_id = pv.run_id
+            JOIN files f ON f.sha256 = pv.sha256
+            JOIN packs p ON p.pack_id = f.pack_id
+            WHERE br.started_at = (
+                SELECT MAX(br2.started_at)
+                FROM path_versions pv2
+                JOIN backup_runs br2 ON br2.run_id = pv2.run_id
+                WHERE pv2.path = pv.path AND br2.started_at <= ?
+            )
+            ORDER BY pv.path
+            """,
+            (target_run["started_at"],),
+        ).fetchall()
     matches = rows if restore_all else [row for row in rows if any(row["path"].startswith(prefix) for prefix in prefixes)]
     if not matches:
         return 0, 0
@@ -814,6 +896,7 @@ def rebuild_catalog(config: dict[str, object], backend_name: str) -> int:
     db.execute("DELETE FROM file_paths")
     db.execute("DELETE FROM files")
     db.execute("DELETE FROM packs")
+    db.execute("DELETE FROM path_versions")
     db.commit()
     count = 0
     with tempfile.TemporaryDirectory() as tmp:
@@ -839,6 +922,7 @@ def rebuild_catalog(config: dict[str, object], backend_name: str) -> int:
                 )
             count += 1
         db.execute("DELETE FROM run_files")
+        db.execute("DELETE FROM path_versions")
         db.commit()
     return count
 
@@ -957,17 +1041,35 @@ def catalog_file_detail(config: dict[str, object], path: str) -> sqlite3.Row | N
     db = connect_db(config)
     row = db.execute(
         """
-        SELECT fp.path, f.size, fp.mtime, fp.sha256, f.pack_id, f.tar_path, p.backend_name, rf.run_id
+        SELECT fp.path, f.size, fp.mtime, fp.sha256, f.pack_id, f.tar_path, p.backend_name,
+               (SELECT pv.run_id FROM path_versions pv WHERE pv.path = fp.path AND pv.sha256 = fp.sha256 ORDER BY pv.recorded_at DESC LIMIT 1) AS run_id,
+               (SELECT COUNT(*) FROM path_versions pv WHERE pv.path = fp.path) AS version_count
         FROM file_paths fp
         JOIN files f ON f.sha256 = fp.sha256
         JOIN packs p ON p.pack_id = f.pack_id
-        LEFT JOIN run_files rf ON rf.path = fp.path AND rf.sha256 = fp.sha256
         WHERE fp.path = ?
         """,
         (path,),
     ).fetchone()
     db.close()
     return row
+
+
+def catalog_file_history(config: dict[str, object], path: str) -> list[sqlite3.Row]:
+    db = connect_db(config)
+    rows = db.execute(
+        """
+        SELECT pv.path, f.size, pv.mtime, pv.sha256, f.pack_id, p.backend_name, pv.run_id, pv.recorded_at
+        FROM path_versions pv
+        JOIN files f ON f.sha256 = pv.sha256
+        JOIN packs p ON p.pack_id = f.pack_id
+        WHERE pv.path = ?
+        ORDER BY pv.recorded_at
+        """,
+        (path,),
+    ).fetchall()
+    db.close()
+    return rows
 
 
 def print_no_rows(label: str, plaintext: bool) -> None:
@@ -1089,7 +1191,7 @@ def render_file_detail(row: sqlite3.Row | None, plaintext: bool) -> None:
         return
     if plaintext:
         click.echo(
-            f"FILE_DETAIL\t{row['path']}\t{row['size']}\t{row['mtime'] or ''}\t{row['sha256']}\t{row['pack_id']}\t{row['tar_path']}\t{row['backend_name']}\t{row['run_id'] or ''}"
+            f"FILE_DETAIL\t{row['path']}\t{row['size']}\t{row['mtime'] or ''}\t{row['sha256']}\t{row['pack_id']}\t{row['tar_path']}\t{row['backend_name']}\t{row['run_id'] or ''}\t{row['version_count']}"
         )
         return
     table = Table(title="File Detail")
@@ -1104,8 +1206,40 @@ def render_file_detail(row: sqlite3.Row | None, plaintext: bool) -> None:
         ("Tar Path", row["tar_path"]),
         ("Backend", row["backend_name"]),
         ("Run", row["run_id"] or ""),
+        ("Versions", row["version_count"]),
     ):
         table.add_row(key, str(value))
+    console.print(table)
+
+
+def render_file_history(rows: list[sqlite3.Row], plaintext: bool) -> None:
+    if plaintext:
+        for row in rows:
+            click.echo(
+                f"FILE_VERSION\t{row['path']}\t{row['run_id']}\t{row['recorded_at']}\t{row['sha256']}\t{row['pack_id']}\t{row['backend_name']}\t{row['size']}\t{row['mtime'] or ''}"
+            )
+        return
+    if not rows:
+        print_no_rows("File history", plaintext=False)
+        return
+    table = Table(title="File History")
+    table.add_column("Path", overflow="fold")
+    table.add_column("Run")
+    table.add_column("Recorded")
+    table.add_column("Pack")
+    table.add_column("Backend")
+    table.add_column("Size", justify="right")
+    table.add_column("Modified")
+    for row in rows:
+        table.add_row(
+            row["path"],
+            row["run_id"],
+            row["recorded_at"],
+            row["pack_id"],
+            row["backend_name"],
+            str(row["size"]),
+            row["mtime"] or "",
+        )
     console.print(table)
 
 
@@ -1138,6 +1272,7 @@ def backup(config_path: Path, dry_run: bool, source: Path) -> None:
 @option_config
 @click.option("--dest", type=click.Path(path_type=Path), required=True)
 @click.option("--all", "restore_all", is_flag=True, help="Restore the entire catalog.")
+@click.option("--as-of-run", help="Restore the latest versions known at or before the given run.")
 @click.option("--backend", "restore_backend", help="Override the backend/profile used to fetch packs.")
 @click.option("--no-hardlinks", is_flag=True, help="Do not restore duplicate files as hardlinks on Linux.")
 @click.option("--force", is_flag=True, help="Overwrite files already present at the destination.")
@@ -1146,6 +1281,7 @@ def restore_cmd(
     config_path: Path,
     dest: Path,
     restore_all: bool,
+    as_of_run: str | None,
     restore_backend: str | None,
     no_hardlinks: bool,
     force: bool,
@@ -1167,6 +1303,7 @@ def restore_cmd(
         restore_all=restore_all,
         no_hardlinks=no_hardlinks,
         backend_name=restore_backend,
+        as_of_run=as_of_run,
     )
     console.print(f"restored: {restored}")
     if pending:
@@ -1306,6 +1443,15 @@ def catalog_packs_cmd(ctx: click.Context, plaintext: bool) -> None:
 def catalog_file_cmd(ctx: click.Context, path: str, plaintext: bool) -> None:
     config, default_plaintext = catalog_context(ctx)
     render_file_detail(catalog_file_detail(config, path), plaintext or default_plaintext)
+
+
+@catalog_group.command("file-history")
+@click.argument("path")
+@click.option("--plaintext", is_flag=True, help="Print line-oriented text instead of rich tables.")
+@click.pass_context
+def catalog_file_history_cmd(ctx: click.Context, path: str, plaintext: bool) -> None:
+    config, default_plaintext = catalog_context(ctx)
+    render_file_history(catalog_file_history(config, path), plaintext or default_plaintext)
 
 
 if __name__ == "__main__":

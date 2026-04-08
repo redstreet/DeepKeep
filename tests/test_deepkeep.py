@@ -157,6 +157,7 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
     assert len(db_rows(config, "SELECT * FROM files")) == 2
     assert len(db_rows(config, "SELECT * FROM file_paths")) == 3
     assert len(db_rows(config, "SELECT * FROM run_files")) == 2
+    assert len(db_rows(config, "SELECT * FROM path_versions")) == 3
 
     pack_path = next(path for path in pack_files if "pack-" in path.name)
     with tarfile.open(pack_path) as tf:
@@ -184,6 +185,7 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
     assert len(db_rows(config, "SELECT * FROM files")) == 2
     assert len(db_rows(config, "SELECT * FROM file_paths")) == 2
     assert len(db_rows(config, "SELECT * FROM run_files")) == 0
+    assert len(db_rows(config, "SELECT * FROM path_versions")) == 0
 
 
 def test_dedupe_second_backup_creates_no_new_pack(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
@@ -195,6 +197,7 @@ def test_dedupe_second_backup_creates_no_new_pack(fake_crypto, repo: tuple[Path,
     assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
     assert len(list(storage.rglob("pack-*.age"))) == first_count
     assert len(db_rows(config, "SELECT * FROM run_files")) == 1
+    assert len(db_rows(config, "SELECT * FROM path_versions")) == 1
 
 
 def test_oversize_file_becomes_single_pack(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
@@ -519,6 +522,68 @@ def test_catalog_packs_and_file_detail(fake_crypto, repo: tuple[Path, Path, Path
     assert result.exit_code == 0, result.output
     assert "FILE_DETAIL\tdetail.txt\t" in result.output
     assert "\tglacier\t" in result.output
+
+
+def test_restore_can_restore_older_version_as_of_run(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, _, _, config = repo
+    target = source / "versioned.txt"
+    target.write_text("old")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+    first_run = db_rows(config, "SELECT run_id FROM backup_runs ORDER BY started_at ASC")[0][0]
+
+    target.write_text("new")
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    latest_dest = tmp_path / "latest"
+    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(latest_dest), "versioned"])
+    assert result.exit_code == 0, result.output
+    assert (latest_dest / "versioned.txt").read_text() == "new"
+
+    old_dest = tmp_path / "old"
+    result = runner.invoke(
+        deepkeep.cli,
+        ["restore", "--config", str(config), "--dest", str(old_dest), "--as-of-run", first_run, "versioned"],
+    )
+    assert result.exit_code == 0, result.output
+    assert (old_dest / "versioned.txt").read_text() == "old"
+
+
+def test_catalog_file_history_lists_versions(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, _, _, config = repo
+    target = source / "history.txt"
+    target.write_text("v1")
+    runner = CliRunner()
+    assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
+    target.write_text("v2")
+    assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
+
+    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "file", "history.txt", "--plaintext"])
+    assert result.exit_code == 0, result.output
+    assert result.output.count("FILE_DETAIL\thistory.txt\t") == 1
+    assert result.output.rstrip().endswith("\t2")
+
+    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "file-history", "history.txt", "--plaintext"])
+    assert result.exit_code == 0, result.output
+    assert result.output.count("FILE_VERSION\thistory.txt\t") == 2
+
+
+def test_restore_as_of_run_requires_known_run(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
+    source, _, _, config = repo
+    (source / "only.txt").write_text("one")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+
+    dest = tmp_path / "restore"
+    result = runner.invoke(
+        deepkeep.cli,
+        ["restore", "--config", str(config), "--dest", str(dest), "--as-of-run", "missing-run", "only"],
+    )
+    assert result.exit_code != 0
+    assert "unknown run_id" in str(result.exception)
 
 
 def test_restore_can_override_backend_source(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
