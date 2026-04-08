@@ -77,6 +77,25 @@ def test_load_config_requires_age_pass_entry(tmp_path: Path) -> None:
         deepkeep.load_config(config)
 
 
+def test_load_config_requires_named_backends(tmp_path: Path) -> None:
+    config = tmp_path / "deepkeep.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "backend: local",
+                f"catalog_path: {tmp_path / 'catalog.sqlite'}",
+                "pack_size_mb: 1",
+                "age_pass_entry: backups/deepkeep",
+                f"work_root: {tmp_path / '.work'}",
+                "local:",
+                f"  root: {tmp_path / 'storage'}",
+            ]
+        )
+    )
+    with pytest.raises(deepkeep.DeepKeepError, match="config.backends"):
+        deepkeep.load_config(config)
+
+
 def test_should_write_catalog_snapshot_weekly_policy() -> None:
     now = "2026-04-07T12:00:00Z"
     assert deepkeep.should_write_catalog_snapshot(now, []) is True

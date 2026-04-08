@@ -177,30 +177,6 @@ def load_config(path: Path) -> dict[str, object]:
     data.setdefault("work_root", str(path.parent / ".deepkeep-work"))
     if "age_pass_entry" not in data:
         raise DeepKeepError("config must define age_pass_entry")
-    if "backends" not in data:
-        legacy_backend = str(data.get("backend", "local"))
-        if legacy_backend == "local":
-            local = data.setdefault("local", {})
-            if "root" not in local:
-                raise DeepKeepError("config.local.root is required for local backend")
-            data["backends"] = {"default": {"type": "local", "root": local["root"]}}
-        elif legacy_backend == "s3":
-            s3 = data.setdefault("s3", {})
-            for key in ("bucket", "prefix"):
-                if key not in s3:
-                    raise DeepKeepError(f"config.s3.{key} is required for s3 backend")
-            s3.setdefault("storage_class", "DEEP_ARCHIVE")
-            data["backends"] = {
-                "default": {
-                    "type": "s3",
-                    "bucket": s3["bucket"],
-                    "prefix": s3["prefix"],
-                    "storage_class": s3["storage_class"],
-                }
-            }
-        else:
-            raise DeepKeepError("backend must be 'local' or 's3'")
-        data["default_backend"] = "default"
     backends = data.get("backends")
     if not isinstance(backends, dict) or not backends:
         raise DeepKeepError("config.backends must be a non-empty mapping")

@@ -53,46 +53,57 @@ DeepKeep reads the first line of that pass entry and sets `AGE_PASSPHRASE_FD` in
 
 ## Backend Selection
 
-The backend is selected in YAML:
+DeepKeep uses named backend profiles in YAML. One profile is marked as the default write backend, and restore can optionally override the source backend.
 
 ```yaml
-backend: local
+default_backend: glacier
+backends:
+  glacier:
+    type: s3
+    bucket: my-backups
+    prefix: deepkeep
+    storage_class: DEEP_ARCHIVE
+  localcopy:
+    type: local
+    root: /path/to/local-storage
 ```
 
-or:
+Behavior:
 
-```yaml
-backend: s3
-```
-
-The same commands work against either backend.
+- `backup` writes to `default_backend`
+- `restore` uses the backend recorded for each pack by default
+- `restore --backend NAME` forces fetches from a specific backend profile instead
 
 ## Local Backend Example
 
 ```yaml
-backend: local
+default_backend: local
 catalog_path: /path/to/catalog.sqlite
 pack_size_mb: 512
 age_pass_entry: backups/deepkeep
 work_root: /path/to/work
 
-local:
-  root: /path/to/local-storage
+backends:
+  local:
+    type: local
+    root: /path/to/local-storage
 ```
 
 ## S3 Backend Example
 
 ```yaml
-backend: s3
+default_backend: glacier
 catalog_path: /path/to/catalog.sqlite
 pack_size_mb: 512
 age_pass_entry: backups/deepkeep
 work_root: /path/to/work
 
-s3:
-  bucket: my-backups
-  prefix: deepkeep
-  storage_class: DEEP_ARCHIVE
+backends:
+  glacier:
+    type: s3
+    bucket: my-backups
+    prefix: deepkeep
+    storage_class: DEEP_ARCHIVE
 ```
 
 Field notes:
@@ -101,6 +112,7 @@ Field notes:
 - `pack_size_mb`: minimum pack target size
 - `age_pass_entry`: `pass` entry holding the encryption passphrase
 - `work_root`: local staging directory for in-progress packs
+- `default_backend`: backend profile name used for new backups
 - `bucket`: S3 bucket name
 - `prefix`: object prefix inside the bucket
 - `storage_class`: S3 storage class used for uploads
@@ -165,16 +177,18 @@ aws s3 ls
 3. Create a config file, for example `deepkeep.yaml`:
 
 ```yaml
-backend: s3
+default_backend: glacier
 catalog_path: /absolute/path/to/catalog.sqlite
 pack_size_mb: 512
 age_pass_entry: backups/deepkeep
 work_root: /absolute/path/to/work
 
-s3:
-  bucket: my-backups
-  prefix: deepkeep
-  storage_class: STANDARD
+backends:
+  glacier:
+    type: s3
+    bucket: my-backups
+    prefix: deepkeep
+    storage_class: STANDARD
 ```
 
 4. Run a backup:
