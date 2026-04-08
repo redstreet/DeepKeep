@@ -34,7 +34,7 @@ def repo(tmp_path: Path) -> tuple[Path, Path, Path]:
                 "backend: local",
                 f"catalog_path: {tmp_path / 'catalog.sqlite'}",
                 "pack_size_mb: 1",
-                "gpg_pass_entry: backups/deepkeep",
+                "age_pass_entry: backups/deepkeep",
                 f"work_root: {tmp_path / '.work'}",
                 "local:",
                 f"  root: {storage}",
@@ -52,6 +52,24 @@ def db_rows(config: Path, sql: str):
         db.close()
 
 
+def test_load_config_requires_age_pass_entry(tmp_path: Path) -> None:
+    config = tmp_path / "deepkeep.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "backend: local",
+                f"catalog_path: {tmp_path / 'catalog.sqlite'}",
+                "pack_size_mb: 1",
+                f"work_root: {tmp_path / '.work'}",
+                "local:",
+                f"  root: {tmp_path / 'storage'}",
+            ]
+        )
+    )
+    with pytest.raises(deepkeep.DeepKeepError, match="age_pass_entry"):
+        deepkeep.load_config(config)
+
+
 def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:
     source, storage, config = repo
     (source / "a").mkdir()
@@ -62,7 +80,7 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
     result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
     assert result.exit_code == 0, result.output
 
-    pack_files = sorted(storage.rglob("*.gpg"))
+    pack_files = sorted(storage.rglob("*.age"))
     assert any("pack-" in path.name for path in pack_files)
     assert any("catalog" in path.as_posix() for path in pack_files)
     assert len(db_rows(config, "SELECT * FROM files")) == 2
@@ -102,9 +120,9 @@ def test_dedupe_second_backup_creates_no_new_pack(fake_crypto, repo: tuple[Path,
     (source / "x.txt").write_text("same")
     runner = CliRunner()
     assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
-    first_count = len(list(storage.rglob("pack-*.gpg")))
+    first_count = len(list(storage.rglob("pack-*.age")))
     assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
-    assert len(list(storage.rglob("pack-*.gpg"))) == first_count
+    assert len(list(storage.rglob("pack-*.age"))) == first_count
     assert len(db_rows(config, "SELECT * FROM run_files")) == 1
 
 
@@ -113,7 +131,7 @@ def test_oversize_file_becomes_single_pack(fake_crypto, repo: tuple[Path, Path, 
     (source / "big.bin").write_bytes(b"x" * (2 * 1024 * 1024))
     result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
     assert result.exit_code == 0, result.output
-    packs = list(storage.rglob("pack-*.gpg"))
+    packs = list(storage.rglob("pack-*.age"))
     assert len(packs) == 1
 
 
@@ -276,7 +294,7 @@ def test_verify_detects_corruption(fake_crypto, repo: tuple[Path, Path, Path]) -
     (source / "bad.txt").write_text("good")
     runner = CliRunner()
     assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
-    pack_path = next(storage.rglob("pack-*.gpg"))
+    pack_path = next(storage.rglob("pack-*.age"))
     with tarfile.open(pack_path, "a") as tf:
         payload = b"evil"
         info = tarfile.TarInfo("files/bad.txt")

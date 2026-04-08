@@ -108,13 +108,22 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def run(args: list[str], *, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run(
+    args: list[str],
+    *,
+    input_text: str | None = None,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
         text=True,
         input=input_text,
         capture_output=True,
         check=check,
+        env=env,
+        pass_fds=pass_fds,
     )
 
 
@@ -132,8 +141,8 @@ def load_config(path: Path) -> dict[str, object]:
     data.setdefault("pack_size_mb", PACK_MIN_MB)
     data.setdefault("catalog_path", str(path.with_suffix(".sqlite")))
     data.setdefault("work_root", str(path.parent / ".deepkeep-work"))
-    if "gpg_pass_entry" not in data:
-        raise DeepKeepError("config must define gpg_pass_entry")
+    if "age_pass_entry" not in data:
+        raise DeepKeepError("config must define age_pass_entry")
     if data["backend"] == "local":
         local = data.setdefault("local", {})
         if "root" not in local:
@@ -151,7 +160,7 @@ def load_config(path: Path) -> dict[str, object]:
 
 def load_passphrase(config: dict[str, object]) -> str:
     require_tool("pass")
-    entry = str(config["gpg_pass_entry"])
+    entry = str(config["age_pass_entry"])
     proc = run(["pass", "show", entry])
     value = proc.stdout.splitlines()[0].strip() if proc.stdout else ""
     if not value:
@@ -159,56 +168,35 @@ def load_passphrase(config: dict[str, object]) -> str:
     return value
 
 
+def run_age_with_batchpass(args: list[str], passphrase: str) -> subprocess.CompletedProcess[str]:
+    require_tool("age")
+    require_tool("age-plugin-batchpass")
+    rfd, wfd = os.pipe()
+    try:
+        os.write(wfd, f"{passphrase}\n".encode())
+        os.close(wfd)
+        env = os.environ.copy()
+        env["AGE_PASSPHRASE_FD"] = str(rfd)
+        return run(args, check=False, env=env, pass_fds=(rfd,))
+    finally:
+        try:
+            os.close(rfd)
+        except OSError:
+            pass
+
+
 def encrypt_file(src: Path, dest: Path, config: dict[str, object]) -> None:
-    require_tool("gpg")
     passphrase = load_passphrase(config)
-    proc = run(
-        [
-            "gpg",
-            "--batch",
-            "--yes",
-            "--pinentry-mode",
-            "loopback",
-            "--passphrase-fd",
-            "0",
-            "--symmetric",
-            "--cipher-algo",
-            "AES256",
-            "--compress-algo",
-            "none",
-            "--output",
-            str(dest),
-            str(src),
-        ],
-        input_text=f"{passphrase}\n",
-        check=False,
-    )
+    proc = run_age_with_batchpass(["age", "--encrypt", "-j", "batchpass", "-o", str(dest), str(src)], passphrase)
     if proc.returncode != 0:
-        raise DeepKeepError(proc.stderr.strip() or "gpg encryption failed")
+        raise DeepKeepError(proc.stderr.strip() or "age encryption failed")
 
 
 def decrypt_file(src: Path, dest: Path, config: dict[str, object]) -> None:
-    require_tool("gpg")
     passphrase = load_passphrase(config)
-    proc = run(
-        [
-            "gpg",
-            "--batch",
-            "--yes",
-            "--pinentry-mode",
-            "loopback",
-            "--passphrase-fd",
-            "0",
-            "--output",
-            str(dest),
-            "--decrypt",
-            str(src),
-        ],
-        input_text=f"{passphrase}\n",
-        check=False,
-    )
+    proc = run_age_with_batchpass(["age", "--decrypt", "-j", "batchpass", "-o", str(dest), str(src)], passphrase)
     if proc.returncode != 0:
-        raise DeepKeepError(proc.stderr.strip() or "gpg decryption failed")
+        raise DeepKeepError(proc.stderr.strip() or "age decryption failed")
 
 
 def connect_db(config: dict[str, object]) -> sqlite3.Connection:
@@ -322,11 +310,11 @@ def write_tar(tar_path: Path, manifest: dict[str, object], entries: list[Entry])
 
 def pack_object_key(pack_id: str, created_at: str) -> str:
     dt = datetime.strptime(created_at, ISO)
-    return f"packs/{dt:%Y/%m}/pack-{pack_id}.tar.gpg"
+    return f"packs/{dt:%Y/%m}/pack-{pack_id}.tar.age"
 
 
 def catalog_object_keys(ts: str) -> tuple[str, str]:
-    return "catalog/latest.sqlite.gpg", f"catalog/snapshots/catalog-{ts.replace(':', '').replace('-', '')}.sqlite.gpg"
+    return "catalog/latest.sqlite.age", f"catalog/snapshots/catalog-{ts.replace(':', '').replace('-', '')}.sqlite.age"
 
 
 def read_stage(path: Path) -> dict[str, object]:
@@ -468,7 +456,7 @@ def snapshot_catalog(config: dict[str, object], backend: LocalBackend | S3Backen
         return
     ts = utc_now()
     with tempfile.TemporaryDirectory() as tmp:
-        enc = Path(tmp) / "catalog.sqlite.gpg"
+        enc = Path(tmp) / "catalog.sqlite.age"
         encrypt_file(catalog, enc, config)
         latest_key, snap_key = catalog_object_keys(ts)
         backend.put_object(latest_key, str(enc))
@@ -483,7 +471,7 @@ def commit_pack(db: sqlite3.Connection, stage: dict[str, object]) -> None:
             stage["object_key"],
             stage["created_at"],
             "off",
-            "gpg",
+            "age",
             1,
             stage["run_id"],
         ),
@@ -535,7 +523,7 @@ def new_pack_state(config: dict[str, object], run_id: str) -> tuple[dict[str, ob
         "object_key": object_key,
         "status": "BUILDING",
         "tar_path": str(pack_dir / "pack.tar"),
-        "enc_path": str(pack_dir / "pack.tar.gpg"),
+        "enc_path": str(pack_dir / "pack.tar.age"),
         "entries": [],
     }
     return state, pack_dir
@@ -644,7 +632,7 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
 
 def fetch_pack(config: dict[str, object], backend: LocalBackend | S3Backend, object_key: str, workdir: Path) -> Path:
     enc_path = workdir / Path(object_key).name
-    tar_path = workdir / enc_path.name.removesuffix(".gpg")
+    tar_path = workdir / enc_path.name.removesuffix(".age")
     backend.get_object(object_key, str(enc_path))
     decrypt_file(enc_path, tar_path, config)
     return tar_path
@@ -767,11 +755,11 @@ def rebuild_catalog(config: dict[str, object]) -> int:
             tar_path = fetch_pack(config, backend, key, tmpdir)
             manifest = read_manifest_from_tar(tar_path)
             name = Path(key).name
-            pack_id = name.split("pack-")[-1].split(".tar.gpg")[0]
+            pack_id = name.split("pack-")[-1].split(".tar.age")[0]
             created_at = str(manifest.get("created_at", utc_now()))
             db.execute(
                 "INSERT OR REPLACE INTO packs(pack_id, object_key, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (pack_id, key, created_at, "off", "gpg", 1, "rebuild"),
+                (pack_id, key, created_at, "off", "age", 1, "rebuild"),
             )
             for item in manifest["files"]:
                 db.execute(
