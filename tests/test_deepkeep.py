@@ -59,6 +59,10 @@ def db_rows(config: Path, sql: str):
         db.close()
 
 
+def cli_args(config: Path, *args: str) -> list[str]:
+    return ["--config", str(config), *args]
+
+
 def test_load_config_requires_age_pass_entry(tmp_path: Path) -> None:
     config = tmp_path / "deepkeep.yaml"
     config.write_text(
@@ -199,7 +203,7 @@ def test_backup_dry_run_is_non_mutating_and_human_readable(fake_crypto, repo: tu
     (source / "alpha.txt").write_text("alpha")
     (source / "beta.txt").write_text("beta")
 
-    result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), "--dry-run", str(source)])
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", "--dry-run", str(source)))
     assert result.exit_code == 0, result.output
     assert "Mode" in result.output
     assert "dry run" in result.output
@@ -222,9 +226,9 @@ def test_backup_dry_run_matches_real_backup_stats(fake_crypto, repo: tuple[Path,
     (source / "b.txt").write_text("two")
     runner = CliRunner()
 
-    dry = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), "--dry-run", str(source)])
+    dry = runner.invoke(deepkeep.cli, cli_args(config, "backup", "--dry-run", str(source)))
     assert dry.exit_code == 0, dry.output
-    real = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    real = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert real.exit_code == 0, real.output
 
     assert "Files to back up" in dry.output
@@ -260,7 +264,7 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
     (source / "a" / "two.txt").write_text("two")
     (source / "dup.txt").write_text("one")
 
-    result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     pack_files = sorted(storage.rglob("*.age"))
@@ -279,7 +283,7 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
     dest = tmp_path / "restore"
     result = CliRunner().invoke(
         deepkeep.cli,
-        ["restore", "--config", str(config), "--dest", str(dest), "a/"],
+        cli_args(config, "restore", "--dest", str(dest), "a/"),
     )
     assert result.exit_code == 0, result.output
     assert (dest / "a" / "one.txt").read_text() == "one"
@@ -287,12 +291,12 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
     assert not (dest / "dup.txt").exists()
 
     pack_id = db_rows(config, "SELECT pack_id FROM packs")[0][0]
-    result = CliRunner().invoke(deepkeep.cli, ["verify-pack", "--config", str(config), pack_id])
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "verify-pack", pack_id))
     assert result.exit_code == 0, result.output
 
     catalog = config.parent / "catalog.sqlite"
     catalog.unlink()
-    result = CliRunner().invoke(deepkeep.cli, ["rebuild-catalog", "--config", str(config), "--backend", "glacier"])
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "rebuild-catalog", "--backend", "glacier"))
     assert result.exit_code == 0, result.output
     assert len(db_rows(config, "SELECT * FROM files")) == 2
     assert len(db_rows(config, "SELECT * FROM file_paths")) == 2
@@ -304,9 +308,9 @@ def test_dedupe_second_backup_creates_no_new_pack(fake_crypto, repo: tuple[Path,
     source, storage, _, config = repo
     (source / "x.txt").write_text("same")
     runner = CliRunner()
-    assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
+    assert runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source))).exit_code == 0
     first_count = len(list(storage.rglob("pack-*.age")))
-    assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
+    assert runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source))).exit_code == 0
     assert len(list(storage.rglob("pack-*.age"))) == first_count
     assert len(db_rows(config, "SELECT * FROM run_files")) == 1
     assert len(db_rows(config, "SELECT * FROM path_versions")) == 1
@@ -315,7 +319,7 @@ def test_dedupe_second_backup_creates_no_new_pack(fake_crypto, repo: tuple[Path,
 def test_oversize_file_becomes_single_pack(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
     source, storage, _, config = repo
     (source / "big.bin").write_bytes(b"x" * (2 * 1024 * 1024))
-    result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
     packs = list(storage.rglob("pack-*.age"))
     assert len(packs) == 1
@@ -325,14 +329,14 @@ def test_restore_skips_existing_without_force(fake_crypto, repo: tuple[Path, Pat
     source, _, _, config = repo
     (source / "keep.txt").write_text("fresh")
     runner = CliRunner()
-    assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
+    assert runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source))).exit_code == 0
     dest = tmp_path / "restore"
     dest.mkdir()
     (dest / "keep.txt").write_text("old")
-    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "keep"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(dest), "keep"))
     assert result.exit_code == 0, result.output
     assert (dest / "keep.txt").read_text() == "old"
-    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "--force", "keep"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(dest), "--force", "keep"))
     assert result.exit_code == 0, result.output
     assert (dest / "keep.txt").read_text() == "fresh"
 
@@ -345,11 +349,11 @@ def test_restore_reapplies_original_mtime(fake_crypto, repo: tuple[Path, Path, P
     os.utime(original, (ts, ts))
 
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     dest = tmp_path / "restore"
-    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "stamp"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(dest), "stamp"))
     assert result.exit_code == 0, result.output
     restored = dest / "stamp.txt"
     assert restored.exists()
@@ -361,11 +365,11 @@ def test_restore_deduped_alias_path(fake_crypto, repo: tuple[Path, Path, Path, P
     (source / "first.txt").write_text("same-bytes")
     (source / "alias.txt").write_text("same-bytes")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     dest = tmp_path / "restore"
-    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "alias"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(dest), "alias"))
     assert result.exit_code == 0, result.output
     assert (dest / "alias.txt").read_text() == "same-bytes"
 
@@ -376,11 +380,11 @@ def test_restore_duplicates_as_hardlinks_on_linux(fake_crypto, repo: tuple[Path,
     (source / "first.txt").write_text("same-bytes")
     (source / "alias.txt").write_text("same-bytes")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     dest = tmp_path / "restore"
-    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "--all"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(dest), "--all"))
     assert result.exit_code == 0, result.output
     first = dest / "alias.txt"
     second = dest / "first.txt"
@@ -394,13 +398,13 @@ def test_restore_duplicates_as_full_copies_with_no_hardlinks(fake_crypto, repo: 
     (source / "first.txt").write_text("same-bytes")
     (source / "alias.txt").write_text("same-bytes")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     dest = tmp_path / "restore"
     result = runner.invoke(
         deepkeep.cli,
-        ["restore", "--config", str(config), "--dest", str(dest), "--all", "--no-hardlinks"],
+        cli_args(config, "restore", "--dest", str(dest), "--all", "--no-hardlinks"),
     )
     assert result.exit_code == 0, result.output
     first = dest / "alias.txt"
@@ -415,13 +419,13 @@ def test_restore_duplicates_as_pointer_files_on_windows(fake_crypto, repo: tuple
     (source / "first.txt").write_text("same-bytes")
     (source / "alias.txt").write_text("same-bytes")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     monkeypatch.setattr(deepkeep, "is_windows_platform", lambda: True)
     monkeypatch.setattr(deepkeep, "is_linux_platform", lambda: False)
     dest = tmp_path / "restore"
-    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "--all"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(dest), "--all"))
     assert result.exit_code == 0, result.output
     assert (dest / "alias.txt").read_text() == "same-bytes"
     pointer = (dest / "first.txt").read_text()
@@ -436,11 +440,11 @@ def test_restore_all_restores_everything(fake_crypto, repo: tuple[Path, Path, Pa
     (source / "a" / "one.txt").write_text("one")
     (source / "two.txt").write_text("two")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     dest = tmp_path / "restore"
-    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest), "--all"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(dest), "--all"))
     assert result.exit_code == 0, result.output
     assert (dest / "a" / "one.txt").read_text() == "one"
     assert (dest / "two.txt").read_text() == "two"
@@ -450,11 +454,11 @@ def test_restore_requires_prefix_or_all(fake_crypto, repo: tuple[Path, Path, Pat
     source, _, _, config = repo
     (source / "only.txt").write_text("one")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     dest = tmp_path / "restore"
-    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(dest)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(dest)))
     assert result.exit_code != 0
     assert "provide at least one path prefix, or use --all" in result.output
 
@@ -463,13 +467,13 @@ def test_restore_rejects_all_with_prefixes(fake_crypto, repo: tuple[Path, Path, 
     source, _, _, config = repo
     (source / "only.txt").write_text("one")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     dest = tmp_path / "restore"
     result = runner.invoke(
         deepkeep.cli,
-        ["restore", "--config", str(config), "--dest", str(dest), "--all", "only"],
+        cli_args(config, "restore", "--dest", str(dest), "--all", "only"),
     )
     assert result.exit_code != 0
     assert "use either PREFIXES or --all, not both" in result.output
@@ -479,7 +483,7 @@ def test_verify_detects_corruption(fake_crypto, repo: tuple[Path, Path, Path, Pa
     source, storage, _, config = repo
     (source / "bad.txt").write_text("good")
     runner = CliRunner()
-    assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
+    assert runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source))).exit_code == 0
     pack_path = next(storage.rglob("pack-*.age"))
     with tarfile.open(pack_path, "a") as tf:
         payload = b"evil"
@@ -487,7 +491,7 @@ def test_verify_detects_corruption(fake_crypto, repo: tuple[Path, Path, Path, Pa
         info.size = len(payload)
         tf.addfile(info, fileobj=deepkeep.io.BytesIO(payload))
     pack_id = db_rows(config, "SELECT pack_id FROM packs")[0][0]
-    result = runner.invoke(deepkeep.cli, ["verify-pack", "--config", str(config), pack_id])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "verify-pack", pack_id))
     assert result.exit_code == 1
 
 
@@ -547,10 +551,10 @@ def test_catalog_default_lists_summary_and_runs(fake_crypto, repo: tuple[Path, P
     (source / "a.txt").write_text("alpha")
     (source / "b.txt").write_text("beta")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
-    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "catalog"))
     assert result.exit_code == 0, result.output
     assert "Catalog Summary" in result.output
     assert "Backup Runs" in result.output
@@ -563,10 +567,10 @@ def test_catalog_plaintext_is_pipe_friendly(fake_crypto, repo: tuple[Path, Path,
     source, _, _, config = repo
     (source / "plain.txt").write_text("hello")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
-    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "--plaintext"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "catalog", "--plaintext"))
     assert result.exit_code == 0, result.output
     assert "Catalog Summary" not in result.output
     assert "Backup Runs" not in result.output
@@ -580,15 +584,15 @@ def test_catalog_run_shows_files_for_specific_backup(fake_crypto, repo: tuple[Pa
     source, _, _, config = repo
     (source / "one.txt").write_text("one")
     runner = CliRunner()
-    first = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    first = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert first.exit_code == 0, first.output
     first_run = db_rows(config, "SELECT run_id FROM backup_runs ORDER BY started_at DESC")[0][0]
 
     (source / "two.txt").write_text("two")
-    second = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    second = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert second.exit_code == 0, second.output
 
-    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "run", first_run])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "catalog", "run", first_run))
     assert result.exit_code == 0, result.output
     assert "Run Detail" in result.output
     assert "Run Files" in result.output
@@ -601,17 +605,17 @@ def test_catalog_files_supports_run_filter_and_plaintext(fake_crypto, repo: tupl
     source, _, _, config = repo
     (source / "keep-a.txt").write_text("a")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
     run_id = db_rows(config, "SELECT run_id FROM backup_runs ORDER BY started_at DESC")[0][0]
 
     (source / "keep-b.txt").write_text("b")
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     result = runner.invoke(
         deepkeep.cli,
-        ["catalog", "--config", str(config), "files", "--run-id", run_id, "--plaintext"],
+        cli_args(config, "catalog", "files", "--run-id", run_id, "--plaintext"),
     )
     assert result.exit_code == 0, result.output
     assert "FILE\tkeep-a.txt\t" in result.output
@@ -622,15 +626,15 @@ def test_catalog_packs_and_file_detail(fake_crypto, repo: tuple[Path, Path, Path
     source, _, _, config = repo
     (source / "detail.txt").write_text("detail")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
-    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "packs", "--plaintext"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "catalog", "packs", "--plaintext"))
     assert result.exit_code == 0, result.output
     assert "PACK\t" in result.output
     assert "\tglacier\t" in result.output
 
-    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "file", "detail.txt", "--plaintext"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "catalog", "file", "detail.txt", "--plaintext"))
     assert result.exit_code == 0, result.output
     assert "FILE_DETAIL\tdetail.txt\t" in result.output
     assert "\tglacier\t" in result.output
@@ -641,23 +645,23 @@ def test_restore_can_restore_older_version_as_of_run(fake_crypto, repo: tuple[Pa
     target = source / "versioned.txt"
     target.write_text("old")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
     first_run = db_rows(config, "SELECT run_id FROM backup_runs ORDER BY started_at ASC")[0][0]
 
     target.write_text("new")
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     latest_dest = tmp_path / "latest"
-    result = runner.invoke(deepkeep.cli, ["restore", "--config", str(config), "--dest", str(latest_dest), "versioned"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(latest_dest), "versioned"))
     assert result.exit_code == 0, result.output
     assert (latest_dest / "versioned.txt").read_text() == "new"
 
     old_dest = tmp_path / "old"
     result = runner.invoke(
         deepkeep.cli,
-        ["restore", "--config", str(config), "--dest", str(old_dest), "--as-of-run", first_run, "versioned"],
+        cli_args(config, "restore", "--dest", str(old_dest), "--as-of-run", first_run, "versioned"),
     )
     assert result.exit_code == 0, result.output
     assert (old_dest / "versioned.txt").read_text() == "old"
@@ -668,16 +672,16 @@ def test_catalog_file_history_lists_versions(fake_crypto, repo: tuple[Path, Path
     target = source / "history.txt"
     target.write_text("v1")
     runner = CliRunner()
-    assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
+    assert runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source))).exit_code == 0
     target.write_text("v2")
-    assert runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)]).exit_code == 0
+    assert runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source))).exit_code == 0
 
-    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "file", "history.txt", "--plaintext"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "catalog", "file", "history.txt", "--plaintext"))
     assert result.exit_code == 0, result.output
     assert result.output.count("FILE_DETAIL\thistory.txt\t") == 1
     assert result.output.rstrip().endswith("\t2")
 
-    result = runner.invoke(deepkeep.cli, ["catalog", "--config", str(config), "file-history", "history.txt", "--plaintext"])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "catalog", "file-history", "history.txt", "--plaintext"))
     assert result.exit_code == 0, result.output
     assert result.output.count("FILE_VERSION\thistory.txt\t") == 2
 
@@ -686,13 +690,13 @@ def test_restore_as_of_run_requires_known_run(fake_crypto, repo: tuple[Path, Pat
     source, _, _, config = repo
     (source / "only.txt").write_text("one")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     dest = tmp_path / "restore"
     result = runner.invoke(
         deepkeep.cli,
-        ["restore", "--config", str(config), "--dest", str(dest), "--as-of-run", "missing-run", "only"],
+        cli_args(config, "restore", "--dest", str(dest), "--as-of-run", "missing-run", "only"),
     )
     assert result.exit_code != 0
     assert "Error: unknown run_id: missing-run" in result.output
@@ -706,7 +710,7 @@ def test_cli_reports_deepkeep_errors_cleanly(fake_crypto, repo: tuple[Path, Path
         raise deepkeep.DeepKeepError("command failed with exit code 1\nstderr:\nAccessDenied")
 
     monkeypatch.setattr(deepkeep, "backup_source", fail_backup)
-    result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code != 0
     assert "Error: command failed with exit code 1" in result.output
     assert "AccessDenied" in result.output
@@ -722,7 +726,7 @@ def test_backup_marks_run_failed_when_snapshot_errors(fake_crypto, repo: tuple[P
         lambda config, backend: (_ for _ in ()).throw(deepkeep.DeepKeepError("catalog snapshot failed\nstderr:\nboom")),
     )
 
-    result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code != 0
     row = db_rows(config, "SELECT status, notes, files_new, packs_created FROM backup_runs ORDER BY started_at DESC")[0]
     assert row[0] == "FAILED"
@@ -743,7 +747,7 @@ def test_new_backup_marks_stale_running_rows_failed(fake_crypto, repo: tuple[Pat
     db.close()
 
     (source / "fresh.txt").write_text("fresh")
-    result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
     stale = db_rows(config, "SELECT status, notes FROM backup_runs WHERE run_id = 'stale123'")[0]
     assert stale[0] == "FAILED"
@@ -754,17 +758,28 @@ def test_restore_can_override_backend_source(fake_crypto, repo: tuple[Path, Path
     source, storage, localcopy, config = repo
     (source / "override.txt").write_text("from-glacier-layout")
     runner = CliRunner()
-    result = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
 
     shutil.copytree(storage / "packs", localcopy / "packs", dirs_exist_ok=True)
     dest = tmp_path / "restore"
     result = runner.invoke(
         deepkeep.cli,
-        ["restore", "--config", str(config), "--backend", "localcopy", "--dest", str(dest), "--all"],
+        cli_args(config, "restore", "--backend", "localcopy", "--dest", str(dest), "--all"),
     )
     assert result.exit_code == 0, result.output
     assert (dest / "override.txt").read_text() == "from-glacier-layout"
 
     pack_backend = db_rows(config, "SELECT backend_name FROM packs")[0][0]
     assert pack_backend == "glacier"
+
+
+def test_cli_uses_deepkeep_config_env_var(fake_crypto, repo: tuple[Path, Path, Path, Path], monkeypatch) -> None:
+    source, _, _, config = repo
+    (source / "env.txt").write_text("env")
+    monkeypatch.setenv("DEEPKEEP_CONFIG", str(config))
+
+    result = CliRunner().invoke(deepkeep.cli, ["backup", str(source)])
+    assert result.exit_code == 0, result.output
+    row = db_rows(config, "SELECT files_new FROM backup_runs ORDER BY started_at DESC")[0]
+    assert row[0] == 1

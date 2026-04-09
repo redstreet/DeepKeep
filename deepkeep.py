@@ -1379,22 +1379,40 @@ def render_file_history(rows: list[sqlite3.Row], plaintext: bool) -> None:
     console.print(table)
 
 
-def option_config(fn):
-    return click.option("--config", "config_path", type=click.Path(path_type=Path), default=Path("deepkeep.yaml"), show_default=True)(fn)
+def cli_config_option(fn):
+    return click.option(
+        "--config",
+        "config_path",
+        type=click.Path(path_type=Path),
+        envvar="DEEPKEEP_CONFIG",
+        default=Path("deepkeep.yaml"),
+        show_default=True,
+        show_envvar=True,
+        help="Path to the DeepKeep YAML config.",
+    )(fn)
+
+
+def current_config(ctx: click.Context) -> dict[str, object]:
+    obj = ctx.find_object(dict) or {}
+    return obj["config"]
 
 
 @click.group(cls=DeepKeepCLI)
-def cli() -> None:
+@cli_config_option
+@click.pass_context
+def cli(ctx: click.Context, config_path: Path) -> None:
     """Low-cost archival backups for local storage and S3 Glacier."""
+    ctx.ensure_object(dict)
+    ctx.obj["config"] = load_config(config_path)
 
 
 @cli.command()
-@option_config
 @click.option("--dry-run", is_flag=True, help="Scan and plan packs without writing or uploading them.")
 @click.argument("source", type=click.Path(exists=True, file_okay=False, path_type=Path))
-def backup(config_path: Path, dry_run: bool, source: Path) -> None:
+@click.pass_context
+def backup(ctx: click.Context, dry_run: bool, source: Path) -> None:
     """Back up SOURCE in sorted directory order."""
-    config = load_config(config_path)
+    config = current_config(ctx)
     stats = backup_source(config, source.resolve(), dry_run=dry_run)
     table = Table(title="Backup Summary")
     table.add_column("Metric")
@@ -1416,7 +1434,6 @@ def backup(config_path: Path, dry_run: bool, source: Path) -> None:
 
 
 @cli.command("restore")
-@option_config
 @click.option("--dest", type=click.Path(path_type=Path), required=True)
 @click.option("--all", "restore_all", is_flag=True, help="Restore the entire catalog.")
 @click.option("--as-of-run", help="Restore the latest versions known at or before the given run.")
@@ -1424,8 +1441,9 @@ def backup(config_path: Path, dry_run: bool, source: Path) -> None:
 @click.option("--no-hardlinks", is_flag=True, help="Do not restore duplicate files as hardlinks on Linux.")
 @click.option("--force", is_flag=True, help="Overwrite files already present at the destination.")
 @click.argument("prefixes", nargs=-1)
+@click.pass_context
 def restore_cmd(
-    config_path: Path,
+    ctx: click.Context,
     dest: Path,
     restore_all: bool,
     as_of_run: str | None,
@@ -1439,7 +1457,7 @@ def restore_cmd(
         raise click.UsageError("use either PREFIXES or --all, not both")
     if not restore_all and not prefixes:
         raise click.UsageError("provide at least one path prefix, or use --all")
-    config = load_config(config_path)
+    config = current_config(ctx)
     if restore_backend is not None:
         get_backend(config, restore_backend)
     restored, pending = restore_prefixes(
@@ -1458,12 +1476,12 @@ def restore_cmd(
 
 
 @cli.command("verify-pack")
-@option_config
 @click.option("--backend", "verify_backend", help="Override the backend/profile used to fetch the pack.")
 @click.argument("pack_id")
-def verify_pack_cmd(config_path: Path, verify_backend: str | None, pack_id: str) -> None:
+@click.pass_context
+def verify_pack_cmd(ctx: click.Context, verify_backend: str | None, pack_id: str) -> None:
     """Verify MANIFEST.json entries against pack contents."""
-    config = load_config(config_path)
+    config = current_config(ctx)
     if verify_backend is not None:
         get_backend(config, verify_backend)
     issues = verify_pack(config, pack_id, backend_name=verify_backend)
@@ -1475,23 +1493,22 @@ def verify_pack_cmd(config_path: Path, verify_backend: str | None, pack_id: str)
 
 
 @cli.command("rebuild-catalog")
-@option_config
 @click.option("--backend", "rebuild_backend", required=True, help="Backend/profile to scan for packs.")
-def rebuild_catalog_cmd(config_path: Path, rebuild_backend: str) -> None:
+@click.pass_context
+def rebuild_catalog_cmd(ctx: click.Context, rebuild_backend: str) -> None:
     """Rebuild SQLite from embedded manifests."""
-    config = load_config(config_path)
+    config = current_config(ctx)
     get_backend(config, rebuild_backend)
     count = rebuild_catalog(config, rebuild_backend)
     console.print(f"rebuilt catalog from {count} pack(s)")
 
 
 @cli.group("catalog", invoke_without_command=True)
-@option_config
 @click.option("--plaintext", is_flag=True, help="Print line-oriented text instead of rich tables.")
 @click.pass_context
-def catalog_group(ctx: click.Context, config_path: Path, plaintext: bool) -> None:
+def catalog_group(ctx: click.Context, plaintext: bool) -> None:
     """Explore catalog summaries, runs, packs, and files."""
-    config = load_config(config_path)
+    config = current_config(ctx)
     ctx.obj = {"config": config, "plaintext": plaintext}
     if ctx.invoked_subcommand is None:
         render_summary(catalog_summary(config), plaintext)

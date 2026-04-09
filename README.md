@@ -33,6 +33,13 @@ Or use the shared virtualenv in this repo setup:
 ~/.venv/ai/bin/python deepkeep.py --help
 ```
 
+For command config selection:
+
+- use `--config /path/to/deepkeep.yaml` on the main command, or
+- set `DEEPKEEP_CONFIG=/path/to/deepkeep.yaml`
+
+If neither is set, DeepKeep defaults to `deepkeep.yaml` in the current directory.
+
 ## Encryption Setup
 
 DeepKeep uses `pass` plus `age-plugin-batchpass` for non-interactive passphrase encryption.
@@ -194,7 +201,7 @@ backends:
 4. Run a backup:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py backup --config deepkeep.yaml /path/to/source
+~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml backup /path/to/source
 ```
 
 5. Inspect uploaded objects:
@@ -240,46 +247,46 @@ Notes:
 Backup:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py backup --config deepkeep.yaml /path/to/source
+~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml backup /path/to/source
 ```
 
 Restore a prefix:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py restore --config deepkeep.yaml --dest /restore/path photos/2024/
+~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml restore --dest /restore/path photos/2024/
 ```
 
 Restore everything:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py restore --config deepkeep.yaml --dest /restore/path --all
+~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml restore --dest /restore/path --all
 ```
 
 Disable Linux hardlink optimization during restore:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py restore --config deepkeep.yaml --dest /restore/path --all --no-hardlinks
+~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml restore --dest /restore/path --all --no-hardlinks
 ```
 
 Verify a pack:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py verify-pack --config deepkeep.yaml <pack_id>
+~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml verify-pack <pack_id>
 ```
 
 Rebuild the local catalog from stored packs:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py rebuild-catalog --config deepkeep.yaml
+~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml rebuild-catalog
 ```
 
 Browse the catalog:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py catalog --config deepkeep.yaml
-~/.venv/ai/bin/python deepkeep.py catalog runs --config deepkeep.yaml
-~/.venv/ai/bin/python deepkeep.py catalog files --config deepkeep.yaml --prefix photos/
-~/.venv/ai/bin/python deepkeep.py catalog --config deepkeep.yaml --plaintext
+~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml catalog
+~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml catalog runs
+~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml catalog files --prefix photos/
+~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml catalog --plaintext
 ```
 
 ## Current Limitations
