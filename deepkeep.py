@@ -163,13 +163,26 @@ class ProgressReader:
 
 
 class PackProgress:
-    def __init__(self, pack_label: str) -> None:
+    def __init__(self, pack_label: str, *, compact_backup: bool = False) -> None:
         self.pack_label = pack_label
+        self.compact_backup = compact_backup
         self.live_enabled = console.is_terminal
+        self.backup_stage_durations: dict[str, str] = {}
 
     def _finish(self, stage: str, started_at: float, ok: bool = True) -> None:
+        duration = self._format_duration(time.monotonic() - started_at)
+        if self.compact_backup and ok and stage in {"build", "encrypt", "upload"}:
+            self.backup_stage_durations[stage] = duration
+            if stage == "upload":
+                console.print(
+                    f"pack {self.pack_label:<8} "
+                    f"b {self.backup_stage_durations.get('build', '--:--')} "
+                    f"e {self.backup_stage_durations.get('encrypt', '--:--')} "
+                    f"u {self.backup_stage_durations.get('upload', '--:--')}"
+                )
+            return
         outcome = "finished" if ok else "failed"
-        console.print(f"pack {self.pack_label:<8} {stage:<9} {outcome:<8} {self._format_duration(time.monotonic() - started_at)}")
+        console.print(f"pack {self.pack_label:<8} {stage:<9} {outcome:<8} {duration}")
 
     def _format_duration(self, seconds: float) -> str:
         total = int(seconds)
@@ -1136,7 +1149,7 @@ def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: Storag
     manifest = make_manifest(entries, state.created_at)
     tar_path = state.tar_file()
     enc_path = state.enc_file()
-    progress = PackProgress(pack_label)
+    progress = PackProgress(pack_label, compact_backup=True)
     try:
         with progress.build(sum(entry.size for entry in entries)) as build_progress:
             write_tar(tar_path, manifest, entries, on_progress=build_progress.advance)

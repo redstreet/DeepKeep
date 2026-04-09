@@ -356,9 +356,9 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
     result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
     assert "pack 1/1" in result.output
-    assert "build" in result.output
-    assert "encrypt" in result.output
-    assert "upload" in result.output
+    assert " b " in result.output
+    assert " e " in result.output
+    assert " u " in result.output
     assert "Packs used" in result.output
 
     pack_files = sorted(storage.rglob("*.age"))
@@ -899,7 +899,7 @@ def test_backup_marks_run_failed_when_snapshot_errors(fake_crypto, repo: tuple[P
     result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code != 0
     assert "pack 1/1" in result.output
-    assert "upload" in result.output
+    assert " u " in result.output
     row = db_rows(config, "SELECT status, notes, files_new, packs_created FROM backup_runs ORDER BY started_at DESC")[0]
     assert row[0] == "FAILED"
     assert row[1] == "catalog snapshot failed"
@@ -950,7 +950,6 @@ def test_backup_reports_failed_stage(fake_crypto, repo: tuple[Path, Path, Path],
     result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code != 0
     assert "pack 1/1" in result.output
-    assert "build" in result.output
     assert "encrypt" in result.output
     assert "failed" in result.output
 
