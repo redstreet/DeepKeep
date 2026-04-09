@@ -513,7 +513,7 @@ def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path, Path],
     run_id = "run123"
     state, pack_dir = deepkeep.new_pack_state(config, run_id, backend.backend_name)
     entry = deepkeep.build_entry(source, source / "resume.txt")
-    state["entries"] = [
+    state.entries = [
         {
             "source": str(entry.source),
             "original_path": entry.rel_path,
@@ -537,7 +537,7 @@ def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path, Path],
         deepkeep.seal_pack(config, db, backend, state, "1/1")
     assert (pack_dir / "state.json").exists()
     stage = deepkeep.read_stage(pack_dir / "state.json")
-    assert stage["status"] == "ENCRYPTED"
+    assert stage.status == "ENCRYPTED"
 
     def copy_ok(key: str, path: str) -> None:
         dest = (storage / key).resolve()

@@ -78,6 +78,80 @@ class Entry:
         }
 
 
+@dataclass
+class StagedPack:
+    pack_id: str
+    run_id: str
+    backend_name: str
+    created_at: str
+    object_key: str
+    status: str
+    tar_path: str
+    enc_path: str
+    entries: list[dict[str, object]]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "pack_id": self.pack_id,
+            "run_id": self.run_id,
+            "backend_name": self.backend_name,
+            "created_at": self.created_at,
+            "object_key": self.object_key,
+            "status": self.status,
+            "tar_path": self.tar_path,
+            "enc_path": self.enc_path,
+            "entries": self.entries,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> StagedPack:
+        return cls(
+            pack_id=str(data["pack_id"]),
+            run_id=str(data["run_id"]),
+            backend_name=str(data["backend_name"]),
+            created_at=str(data["created_at"]),
+            object_key=str(data["object_key"]),
+            status=str(data["status"]),
+            tar_path=str(data["tar_path"]),
+            enc_path=str(data["enc_path"]),
+            entries=list(data.get("entries", [])),
+        )
+
+    def tar_file(self) -> Path:
+        return Path(self.tar_path)
+
+    def enc_file(self) -> Path:
+        return Path(self.enc_path)
+
+    def state_file(self) -> Path:
+        return self.tar_file().parent / "state.json"
+
+    def entry_objects(self) -> list[Entry]:
+        return [
+            Entry(
+                source=Path(str(item["source"])),
+                rel_path=str(item["original_path"]),
+                member_path=str(item["member_path"]),
+                size=int(item["size"]),
+                sha256=str(item["sha256"]),
+                mtime=str(item["mtime"]),
+            )
+            for item in self.entries
+        ]
+
+    def append_entry(self, entry: Entry) -> None:
+        self.entries.append(
+            {
+                "source": str(entry.source),
+                "original_path": entry.rel_path,
+                "member_path": entry.member_path,
+                "size": entry.size,
+                "sha256": entry.sha256,
+                "mtime": entry.mtime,
+            }
+        )
+
+
 class ProgressReader:
     def __init__(self, fh, callback):
         self.fh = fh
@@ -632,12 +706,12 @@ def catalog_object_keys(ts: str) -> tuple[str, str]:
     return "catalog/latest.sqlite.age", f"catalog/snapshots/catalog-{ts.replace(':', '').replace('-', '')}.sqlite.age"
 
 
-def read_stage(path: Path) -> dict[str, object]:
-    return json.loads(path.read_text())
+def read_stage(path: Path) -> StagedPack:
+    return StagedPack.from_dict(json.loads(path.read_text()))
 
 
-def write_stage(path: Path, data: dict[str, object]) -> None:
-    path.write_text(json.dumps(data, indent=2, sort_keys=True))
+def write_stage(path: Path, data: StagedPack) -> None:
+    path.write_text(json.dumps(data.as_dict(), indent=2, sort_keys=True))
 
 
 class LocalBackend:
@@ -844,24 +918,24 @@ def snapshot_catalog(config: dict[str, object], backend: StorageBackend) -> None
             raise wrap_error("catalog snapshot failed", exc) from exc
 
 
-def commit_pack(db: sqlite3.Connection, stage: dict[str, object]) -> None:
+def commit_pack(db: sqlite3.Connection, stage: StagedPack) -> None:
     db.execute(
         "INSERT OR REPLACE INTO packs(pack_id, object_key, backend_name, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            stage["pack_id"],
-            stage["object_key"],
-            stage["backend_name"],
-            stage["created_at"],
+            stage.pack_id,
+            stage.object_key,
+            stage.backend_name,
+            stage.created_at,
             "off",
             "age",
             1,
-            stage["run_id"],
+            stage.run_id,
         ),
     )
-    for item in stage["entries"]:
+    for item in stage.entries:
         db.execute(
             "INSERT OR IGNORE INTO files(sha256, size, pack_id, tar_path) VALUES (?, ?, ?, ?)",
-            (item["sha256"], item["size"], stage["pack_id"], item["member_path"]),
+            (item["sha256"], item["size"], stage.pack_id, item["member_path"]),
         )
         db.execute(
             "INSERT OR REPLACE INTO file_paths(path, sha256, mtime) VALUES (?, ?, ?)",
@@ -869,16 +943,16 @@ def commit_pack(db: sqlite3.Connection, stage: dict[str, object]) -> None:
         )
         db.execute(
             "INSERT OR REPLACE INTO run_files(run_id, path, sha256, size, mtime, pack_id) VALUES (?, ?, ?, ?, ?, ?)",
-            (stage["run_id"], item["original_path"], item["sha256"], item["size"], item.get("mtime"), stage["pack_id"]),
+            (stage.run_id, item["original_path"], item["sha256"], item["size"], item.get("mtime"), stage.pack_id),
         )
         record_path_version(
             db,
             path=item["original_path"],
             sha256=item["sha256"],
             mtime=item.get("mtime"),
-            run_id=stage["run_id"],
-            recorded_at=stage["created_at"],
-            pack_id=stage["pack_id"],
+            run_id=stage.run_id,
+            recorded_at=stage.created_at,
+            pack_id=stage.pack_id,
         )
     db.commit()
 
@@ -887,77 +961,67 @@ def resume_pending(config: dict[str, object], db: sqlite3.Connection, backend: S
     committed = 0
     for state_path in sorted(stage_root(config).glob("packs/*/state.json")):
         stage = read_stage(state_path)
-        enc = Path(stage["enc_path"])
-        stage_backend = get_backend(config, str(stage.get("backend_name", get_default_backend_name(config))))
-        if stage["status"] == "ENCRYPTED":
-            stage_backend.put_object(stage["object_key"], str(enc))
-            stage["status"] = "UPLOADED"
+        enc = stage.enc_file()
+        stage_backend = get_backend(config, stage.backend_name)
+        if stage.status == "ENCRYPTED":
+            stage_backend.put_object(stage.object_key, str(enc))
+            stage.status = "UPLOADED"
             write_stage(state_path, stage)
-        if stage["status"] == "UPLOADED":
+        if stage.status == "UPLOADED":
             commit_pack(db, stage)
-            stage["status"] = "COMMITTED"
+            stage.status = "COMMITTED"
             write_stage(state_path, stage)
             shutil.rmtree(state_path.parent)
             committed += 1
     return committed
 
 
-def new_pack_state(config: dict[str, object], run_id: str, backend_name: str) -> tuple[dict[str, object], Path]:
+def new_pack_state(config: dict[str, object], run_id: str, backend_name: str) -> tuple[StagedPack, Path]:
     pack_id = uuid.uuid4().hex[:12]
     created_at = utc_now()
     object_key = pack_object_key(pack_id, created_at)
     pack_dir = stage_root(config) / "packs" / pack_id
     pack_dir.mkdir(parents=True, exist_ok=True)
-    state = {
-        "pack_id": pack_id,
-        "run_id": run_id,
-        "backend_name": backend_name,
-        "created_at": created_at,
-        "object_key": object_key,
-        "status": "BUILDING",
-        "tar_path": str(pack_dir / "pack.tar"),
-        "enc_path": str(pack_dir / "pack.tar.age"),
-        "entries": [],
-    }
+    state = StagedPack(
+        pack_id=pack_id,
+        run_id=run_id,
+        backend_name=backend_name,
+        created_at=created_at,
+        object_key=object_key,
+        status="BUILDING",
+        tar_path=str(pack_dir / "pack.tar"),
+        enc_path=str(pack_dir / "pack.tar.age"),
+        entries=[],
+    )
     return state, pack_dir
 
 
-def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: StorageBackend, state: dict[str, object], pack_label: str) -> None:
-    entries = [
-        Entry(
-            source=Path(item["source"]),
-            rel_path=item["original_path"],
-            member_path=item["member_path"],
-            size=int(item["size"]),
-            sha256=item["sha256"],
-            mtime=item["mtime"],
-        )
-        for item in state["entries"]
-    ]
-    manifest = make_manifest(entries, str(state["created_at"]))
-    tar_path = Path(str(state["tar_path"]))
-    enc_path = Path(str(state["enc_path"]))
+def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: StorageBackend, state: StagedPack, pack_label: str) -> None:
+    entries = state.entry_objects()
+    manifest = make_manifest(entries, state.created_at)
+    tar_path = state.tar_file()
+    enc_path = state.enc_file()
     progress = PackProgress(pack_label)
     try:
         with progress.build(sum(entry.size for entry in entries)) as build_progress:
             write_tar(tar_path, manifest, entries, on_progress=build_progress.advance)
     except Exception as exc:
         raise wrap_error("pack build failed", exc) from exc
-    write_stage(tar_path.parent / "state.json", state)
+    write_stage(state.state_file(), state)
     try:
         with progress.stage("encrypt"):
             encrypt_file(tar_path, enc_path, config)
     except Exception as exc:
         raise wrap_error("pack encryption failed", exc) from exc
-    state["status"] = "ENCRYPTED"
-    write_stage(tar_path.parent / "state.json", state)
+    state.status = "ENCRYPTED"
+    write_stage(state.state_file(), state)
     try:
         with progress.stage("upload"):
-            backend.put_object(str(state["object_key"]), str(enc_path))
+            backend.put_object(state.object_key, str(enc_path))
     except Exception as exc:
         raise wrap_error("pack upload failed", exc) from exc
-    state["status"] = "UPLOADED"
-    write_stage(tar_path.parent / "state.json", state)
+    state.status = "UPLOADED"
+    write_stage(state.state_file(), state)
     try:
         commit_pack(db, state)
     except Exception as exc:
@@ -976,14 +1040,8 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
     backend = get_default_backend(config)
     resume_pending(config, db, backend)
     fail_stale_runs(db)
-    run_id = uuid.uuid4().hex[:12]
-    started = utc_now()
-    db.execute(
-        "INSERT INTO backup_runs(run_id, started_at, machine, source_path, status) VALUES (?, ?, ?, ?, ?)",
-        (run_id, started, socket.gethostname(), str(source), "RUNNING"),
-    )
-    db.commit()
-    stats = {"files_scanned": 0, "files_new": 0, "files_deduped": 0, "bytes_new": 0, "bytes_total_scanned": 0, "packs_created": 0}
+    run_id, started = start_backup_run(db, source)
+    stats = empty_backup_stats()
     target = int(config["pack_size_mb"]) * 1024 * 1024
     backend_name = backend.backend_name
     state, _ = new_pack_state(config, run_id, backend_name)
@@ -1000,49 +1058,30 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
                 stats["bytes_total_scanned"] += entry.size
                 upsert_file_path(db, entry)
                 if entry.sha256 in run_hashes or has_hash(db, entry.sha256):
-                    stats["files_deduped"] += 1
-                    if should_record_path_version(previous, entry):
-                        blob = lookup_file_blob(db, entry.sha256)
-                        record_path_version(
-                            db,
-                            path=entry.rel_path,
-                            sha256=entry.sha256,
-                            mtime=entry.mtime,
-                            run_id=run_id,
-                            recorded_at=started,
-                            pack_id=None if blob is None else blob["pack_id"],
-                        )
+                    handle_deduped_entry(db, run_id, started, stats, previous, entry)
                     continue
-                stats["files_new"] += 1
-                stats["bytes_new"] += entry.size
-                run_hashes.add(entry.sha256)
-                state["entries"].append(
-                    {
-                        "source": str(entry.source),
-                        "original_path": entry.rel_path,
-                        "member_path": entry.member_path,
-                        "size": entry.size,
-                        "sha256": entry.sha256,
-                        "mtime": entry.mtime,
-                    }
-                )
-                current_size += entry.size
+                current_size += append_new_entry(state, entry, stats, run_hashes)
                 if current_size >= target:
-                    stats["packs_created"] += 1
-                    scan_progress.suspend()
-                    seal_pack(config, db, backend, state, f"{next_pack_number}/{prescan['packs_estimated']}")
-                    scan_progress.resume()
-                    next_pack_number += 1
-                    state, _ = new_pack_state(config, run_id, backend_name)
+                    state, next_pack_number = finalize_stage_pack(
+                        config,
+                        db,
+                        backend,
+                        state,
+                        stats,
+                        scan_progress,
+                        next_pack_number,
+                        prescan["packs_estimated"],
+                    )
                     current_size = 0
-        if state["entries"]:
-            stats["packs_created"] += 1
-            scan_progress.suspend()
-            seal_pack(config, db, backend, state, f"{next_pack_number}/{prescan['packs_estimated']}")
-            scan_progress.resume()
-        if not dry_run:
-            snapshot_catalog(config, backend)
-        update_backup_run(db, run_id, stats, status="DRY_RUN" if dry_run else "COMPLETED")
+            if state.entries:
+                scan_progress.suspend()
+                try:
+                    stats["packs_created"] += 1
+                    seal_pack(config, db, backend, state, f"{next_pack_number}/{prescan['packs_estimated']}")
+                finally:
+                    scan_progress.resume()
+        snapshot_catalog(config, backend)
+        update_backup_run(db, run_id, stats, status="COMPLETED")
         return stats
     except Exception as exc:
         update_backup_run(db, run_id, stats, status="FAILED", notes=error_note(exc))
@@ -1087,6 +1126,70 @@ def pre_scan_source(config: dict[str, object], source: Path) -> dict[str, int]:
     return {"files_scanned": total_files, "bytes_total_scanned": total_bytes, "packs_estimated": packs_estimated}
 
 
+def empty_backup_stats() -> dict[str, int]:
+    return {"files_scanned": 0, "files_new": 0, "files_deduped": 0, "bytes_new": 0, "bytes_total_scanned": 0, "packs_created": 0}
+
+
+def start_backup_run(db: sqlite3.Connection, source: Path) -> tuple[str, str]:
+    run_id = uuid.uuid4().hex[:12]
+    started = utc_now()
+    db.execute(
+        "INSERT INTO backup_runs(run_id, started_at, machine, source_path, status) VALUES (?, ?, ?, ?, ?)",
+        (run_id, started, socket.gethostname(), str(source), "RUNNING"),
+    )
+    db.commit()
+    return run_id, started
+
+
+def handle_deduped_entry(
+    db: sqlite3.Connection,
+    run_id: str,
+    started: str,
+    stats: dict[str, int],
+    previous: sqlite3.Row | None,
+    entry: Entry,
+) -> None:
+    stats["files_deduped"] += 1
+    if should_record_path_version(previous, entry):
+        blob = lookup_file_blob(db, entry.sha256)
+        record_path_version(
+            db,
+            path=entry.rel_path,
+            sha256=entry.sha256,
+            mtime=entry.mtime,
+            run_id=run_id,
+            recorded_at=started,
+            pack_id=None if blob is None else blob["pack_id"],
+        )
+
+
+def append_new_entry(state: StagedPack, entry: Entry, stats: dict[str, int], run_hashes: set[str]) -> int:
+    stats["files_new"] += 1
+    stats["bytes_new"] += entry.size
+    run_hashes.add(entry.sha256)
+    state.append_entry(entry)
+    return entry.size
+
+
+def finalize_stage_pack(
+    config: dict[str, object],
+    db: sqlite3.Connection,
+    backend: StorageBackend,
+    state: StagedPack,
+    stats: dict[str, int],
+    scan_progress: ScanProgress,
+    pack_number: int,
+    pack_total: int,
+) -> tuple[StagedPack, int]:
+    stats["packs_created"] += 1
+    scan_progress.suspend()
+    try:
+        seal_pack(config, db, backend, state, f"{pack_number}/{pack_total}")
+    finally:
+        scan_progress.resume()
+    return new_pack_state(config, state.run_id, backend.backend_name)[0], pack_number + 1
+
+
 def fetch_pack(config: dict[str, object], backend: StorageBackend, object_key: str, workdir: Path, progress: PackProgress | None = None) -> Path:
     enc_path = workdir / Path(object_key).name
     tar_path = workdir / enc_path.name.removesuffix(".age")
@@ -1109,17 +1212,12 @@ def read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
             return json.load(fh)
 
 
-def restore_prefixes(
-    config: dict[str, object],
+def select_restore_rows(
+    db: sqlite3.Connection,
     prefixes: tuple[str, ...],
-    dest: Path,
-    force: bool = False,
-    restore_all: bool = False,
-    no_hardlinks: bool = False,
-    backend_name: str | None = None,
-    as_of_run: str | None = None,
-) -> tuple[int, int]:
-    db = connect_db(config)
+    restore_all: bool,
+    as_of_run: str | None,
+) -> list[sqlite3.Row]:
     if as_of_run is None:
         rows = db.execute(
             """
@@ -1151,70 +1249,140 @@ def restore_prefixes(
             """,
             (target_run["started_at"],),
         ).fetchall()
-    matches = rows if restore_all else [row for row in rows if any(row["path"].startswith(prefix) for prefix in prefixes)]
-    if not matches:
-        return 0, 0
+    if restore_all:
+        return rows
+    return [row for row in rows if any(row["path"].startswith(prefix) for prefix in prefixes)]
+
+
+def group_restore_rows(rows: list[sqlite3.Row], backend_name: str | None) -> dict[tuple[str, str], list[sqlite3.Row]]:
     by_pack: dict[tuple[str, str], list[sqlite3.Row]] = defaultdict(list)
-    for row in matches:
+    for row in rows:
         source_backend = backend_name or row["backend_name"]
         by_pack[(source_backend, row["pack_id"])].append(row)
+    return by_pack
+
+
+def restore_pack_ready(backend: StorageBackend, object_key: str, progress: PackProgress) -> str:
+    with progress.stage("check"):
+        status = backend.restore_status(object_key)
+    if status == "cold":
+        with progress.stage("requesting restore"):
+            return backend.request_restore(object_key)
+    return status
+
+
+def restore_one_target(
+    tf: tarfile.TarFile,
+    row: sqlite3.Row,
+    target: Path,
+    *,
+    force: bool,
+    no_hardlinks: bool,
+    canonical_by_hash: dict[str, tuple[Path, str]],
+) -> int:
+    if target.exists() and not force:
+        return 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if force:
+        remove_existing_target(target)
+    canonical = canonical_by_hash.get(row["sha256"])
+    if canonical is None:
+        member = tf.extractfile(row["tar_path"])
+        if member is None:
+            raise DeepKeepError(f"missing member in pack: {row['tar_path']}")
+        data = member.read()
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != row["sha256"]:
+            raise DeepKeepError(f"hash mismatch while restoring {row['path']}")
+        target.write_bytes(data)
+        apply_mtime(target, row["mtime"])
+        canonical_by_hash[row["sha256"]] = (target, row["path"])
+        return len(data)
+    canonical_target, canonical_rel = canonical
+    logical_size = int(row["size"])
+    if is_windows_platform():
+        write_pointer_file(target, canonical_rel, canonical_target, row["sha256"], row["mtime"])
+    elif is_linux_platform() and not no_hardlinks:
+        try:
+            os.link(canonical_target, target)
+        except OSError:
+            write_full_copy(target, canonical_target, row["mtime"])
+    else:
+        write_full_copy(target, canonical_target, row["mtime"])
+    return logical_size
+
+
+def restore_rows_from_pack(
+    tf: tarfile.TarFile,
+    rows_in_pack: list[sqlite3.Row],
+    dest: Path,
+    *,
+    force: bool,
+    no_hardlinks: bool,
+    pack_progress: PackProgress,
+    canonical_by_hash: dict[str, tuple[Path, str]],
+) -> int:
     restored = 0
-    pending = 0
-    canonical_by_hash: dict[str, tuple[Path, str]] = {}
-    with tempfile.TemporaryDirectory() as tmp:
-        tmpdir = Path(tmp)
-        for rows_in_pack in by_pack.values():
-            backend = get_backend(config, rows_in_pack[0]["backend_name"] if backend_name is None else backend_name)
-            object_key = rows_in_pack[0]["object_key"]
-            pack_progress = PackProgress(rows_in_pack[0]["pack_id"])
-            with pack_progress.stage("check"):
-                status = backend.restore_status(object_key)
-            if status != "ready":
-                if status == "cold":
-                    with pack_progress.stage("requesting restore"):
-                        status = backend.request_restore(object_key)
-                pending += 1
+    with pack_progress.restore(sum(int(row["size"]) for row in rows_in_pack)) as restore_progress:
+        for row in rows_in_pack:
+            restored_bytes = restore_one_target(
+                tf,
+                row,
+                dest / row["path"],
+                force=force,
+                no_hardlinks=no_hardlinks,
+                canonical_by_hash=canonical_by_hash,
+            )
+            if restored_bytes == 0:
                 continue
-            tar_path = fetch_pack(config, backend, object_key, tmpdir, progress=pack_progress)
-            with tarfile.open(tar_path) as tf:
-                with pack_progress.restore(sum(int(row["size"]) for row in rows_in_pack)) as restore_progress:
-                    for row in rows_in_pack:
-                        rel = row["path"]
-                        target = dest / rel
-                        if target.exists() and not force:
-                            continue
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        if force:
-                            remove_existing_target(target)
-                        canonical = canonical_by_hash.get(row["sha256"])
-                        logical_size = 0
-                        if canonical is None:
-                            member = tf.extractfile(row["tar_path"])
-                            if member is None:
-                                raise DeepKeepError(f"missing member in pack: {row['tar_path']}")
-                            data = member.read()
-                            digest = hashlib.sha256(data).hexdigest()
-                            if digest != row["sha256"]:
-                                raise DeepKeepError(f"hash mismatch while restoring {rel}")
-                            target.write_bytes(data)
-                            logical_size = len(data)
-                            apply_mtime(target, row["mtime"])
-                            canonical_by_hash[row["sha256"]] = (target, rel)
-                        else:
-                            canonical_target, canonical_rel = canonical
-                            logical_size = int(row["size"])
-                            if is_windows_platform():
-                                write_pointer_file(target, canonical_rel, canonical_target, row["sha256"], row["mtime"])
-                            elif is_linux_platform() and not no_hardlinks:
-                                try:
-                                    os.link(canonical_target, target)
-                                except OSError:
-                                    write_full_copy(target, canonical_target, row["mtime"])
-                            else:
-                                write_full_copy(target, canonical_target, row["mtime"])
-                        restore_progress.advance(logical_size)
-                        restored += 1
-    return restored, pending
+            restore_progress.advance(restored_bytes)
+            restored += 1
+    return restored
+
+
+def restore_prefixes(
+    config: dict[str, object],
+    prefixes: tuple[str, ...],
+    dest: Path,
+    force: bool = False,
+    restore_all: bool = False,
+    no_hardlinks: bool = False,
+    backend_name: str | None = None,
+    as_of_run: str | None = None,
+) -> tuple[int, int]:
+    db = connect_db(config)
+    try:
+        matches = select_restore_rows(db, prefixes, restore_all, as_of_run)
+        if not matches:
+            return 0, 0
+        by_pack = group_restore_rows(matches, backend_name)
+        restored = 0
+        pending = 0
+        canonical_by_hash: dict[str, tuple[Path, str]] = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            for rows_in_pack in by_pack.values():
+                backend = get_backend(config, rows_in_pack[0]["backend_name"] if backend_name is None else backend_name)
+                object_key = rows_in_pack[0]["object_key"]
+                pack_progress = PackProgress(rows_in_pack[0]["pack_id"])
+                status = restore_pack_ready(backend, object_key, pack_progress)
+                if status != "ready":
+                    pending += 1
+                    continue
+                tar_path = fetch_pack(config, backend, object_key, tmpdir, progress=pack_progress)
+                with tarfile.open(tar_path) as tf:
+                    restored += restore_rows_from_pack(
+                        tf,
+                        rows_in_pack,
+                        dest,
+                        force=force,
+                        no_hardlinks=no_hardlinks,
+                        pack_progress=pack_progress,
+                        canonical_by_hash=canonical_by_hash,
+                    )
+        return restored, pending
+    finally:
+        db.close()
 
 
 def verify_pack(config: dict[str, object], pack_id: str, backend_name: str | None = None) -> list[str]:
