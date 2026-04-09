@@ -155,6 +155,45 @@ def test_s3_list_objects_returns_empty_for_missing_prefix(monkeypatch) -> None:
     assert backend.list_objects("catalog/snapshots") == []
 
 
+def test_s3_restore_status_is_ready_for_standard_storage(monkeypatch) -> None:
+    monkeypatch.setattr(deepkeep, "require_tool", lambda name: None)
+    backend = deepkeep.S3Backend(
+        "glacier",
+        {"type": "s3", "bucket": "deepkeeptest", "prefix": "dkt", "storage_class": "DEEP_ARCHIVE"},
+    )
+
+    def fake_run(args, **kwargs):
+        return deepkeep.subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout='{"StorageClass":"STANDARD"}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(deepkeep, "run", fake_run)
+    assert backend.restore_status("packs/x.tar.age") == "ready"
+    assert backend.request_restore("packs/x.tar.age") == "ready"
+
+
+def test_s3_restore_status_uses_restore_header_for_archive_storage(monkeypatch) -> None:
+    monkeypatch.setattr(deepkeep, "require_tool", lambda name: None)
+    backend = deepkeep.S3Backend(
+        "glacier",
+        {"type": "s3", "bucket": "deepkeeptest", "prefix": "dkt", "storage_class": "DEEP_ARCHIVE"},
+    )
+
+    def fake_run(args, **kwargs):
+        return deepkeep.subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout='{"StorageClass":"DEEP_ARCHIVE","Restore":"ongoing-request=\\"true\\""}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(deepkeep, "run", fake_run)
+    assert backend.restore_status("packs/x.tar.age") == "pending"
+
+
 def test_run_formats_called_process_error(monkeypatch) -> None:
     def boom(*args, **kwargs):
         raise deepkeep.subprocess.CalledProcessError(

@@ -541,6 +541,9 @@ class S3Backend:
     def restore_status(self, key: str) -> str:
         proc = run(["aws", "s3api", "head-object", "--bucket", self.bucket, "--key", f"{self.prefix}/{key}"])
         meta = json.loads(proc.stdout or "{}")
+        storage_class = str(meta.get("StorageClass", "STANDARD") or "STANDARD")
+        if storage_class not in {"GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"}:
+            return "ready"
         hdr = str(meta.get("Restore", ""))
         if 'ongoing-request="false"' in hdr:
             return "ready"
