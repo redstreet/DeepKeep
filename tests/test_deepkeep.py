@@ -155,6 +155,25 @@ def test_s3_list_objects_returns_empty_for_missing_prefix(monkeypatch) -> None:
     assert backend.list_objects("catalog/snapshots") == []
 
 
+def test_run_formats_called_process_error(monkeypatch) -> None:
+    def boom(*args, **kwargs):
+        raise deepkeep.subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["aws", "s3", "ls", "s3://bucket/prefix"],
+            output="objects",
+            stderr="AccessDenied",
+        )
+
+    monkeypatch.setattr(deepkeep.subprocess, "run", boom)
+    with pytest.raises(deepkeep.DeepKeepError) as exc:
+        deepkeep.run(["aws", "s3", "ls", "s3://bucket/prefix"])
+    message = str(exc.value)
+    assert "command failed with exit code 1" in message
+    assert "command: aws s3 ls s3://bucket/prefix" in message
+    assert "stdout:\nobjects" in message
+    assert "stderr:\nAccessDenied" in message
+
+
 def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
     source, storage, _, config = repo
     (source / "a").mkdir()
@@ -597,7 +616,22 @@ def test_restore_as_of_run_requires_known_run(fake_crypto, repo: tuple[Path, Pat
         ["restore", "--config", str(config), "--dest", str(dest), "--as-of-run", "missing-run", "only"],
     )
     assert result.exit_code != 0
-    assert "unknown run_id" in str(result.exception)
+    assert "Error: unknown run_id: missing-run" in result.output
+
+
+def test_cli_reports_deepkeep_errors_cleanly(fake_crypto, repo: tuple[Path, Path, Path, Path], monkeypatch) -> None:
+    source, _, _, config = repo
+    (source / "file.txt").write_text("x")
+
+    def fail_backup(*args, **kwargs):
+        raise deepkeep.DeepKeepError("command failed with exit code 1\nstderr:\nAccessDenied")
+
+    monkeypatch.setattr(deepkeep, "backup_source", fail_backup)
+    result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code != 0
+    assert "Error: command failed with exit code 1" in result.output
+    assert "AccessDenied" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_restore_can_override_backend_source(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -33,6 +34,14 @@ WEEK_SECONDS = 7 * 24 * 60 * 60
 
 class DeepKeepError(RuntimeError):
     pass
+
+
+class DeepKeepCLI(click.Group):
+    def invoke(self, ctx: click.Context):
+        try:
+            return super().invoke(ctx)
+        except DeepKeepError as exc:
+            raise click.ClickException(str(exc)) from exc
 
 
 class StorageBackend(Protocol):
@@ -151,15 +160,34 @@ def run(
     env: dict[str, str] | None = None,
     pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        args,
-        text=True,
-        input=input_text,
-        capture_output=True,
-        check=check,
-        env=env,
-        pass_fds=pass_fds,
-    )
+    try:
+        return subprocess.run(
+            args,
+            text=True,
+            input=input_text,
+            capture_output=True,
+            check=check,
+            env=env,
+            pass_fds=pass_fds,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise DeepKeepError(format_subprocess_error(exc)) from exc
+
+
+def format_subprocess_error(exc: subprocess.CalledProcessError) -> str:
+    lines = [
+        f"command failed with exit code {exc.returncode}",
+        f"command: {shlex.join(str(part) for part in exc.cmd)}",
+    ]
+    stdout = (exc.stdout or "").strip()
+    stderr = (exc.stderr or "").strip()
+    if stdout:
+        lines.append("stdout:")
+        lines.append(stdout)
+    if stderr:
+        lines.append("stderr:")
+        lines.append(stderr)
+    return "\n".join(lines)
 
 
 def require_tool(name: str) -> None:
@@ -1249,7 +1277,7 @@ def option_config(fn):
     return click.option("--config", "config_path", type=click.Path(path_type=Path), default=Path("deepkeep.yaml"), show_default=True)(fn)
 
 
-@click.group()
+@click.group(cls=DeepKeepCLI)
 def cli() -> None:
     """Low-cost archival backups for local storage and S3 Glacier."""
 
