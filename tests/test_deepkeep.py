@@ -266,6 +266,9 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
 
     result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
+    assert " build finished in " in result.output
+    assert " encrypt finished in " in result.output
+    assert " upload finished in " in result.output
 
     pack_files = sorted(storage.rglob("*.age"))
     assert any("pack-" in path.name for path in pack_files)
@@ -728,6 +731,7 @@ def test_backup_marks_run_failed_when_snapshot_errors(fake_crypto, repo: tuple[P
 
     result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code != 0
+    assert "upload finished in" in result.output
     row = db_rows(config, "SELECT status, notes, files_new, packs_created FROM backup_runs ORDER BY started_at DESC")[0]
     assert row[0] == "FAILED"
     assert row[1] == "catalog snapshot failed"
@@ -772,6 +776,16 @@ def test_restore_can_override_backend_source(fake_crypto, repo: tuple[Path, Path
 
     pack_backend = db_rows(config, "SELECT backend_name FROM packs")[0][0]
     assert pack_backend == "glacier"
+
+
+def test_backup_reports_failed_stage(fake_crypto, repo: tuple[Path, Path, Path, Path], monkeypatch) -> None:
+    source, _, _, config = repo
+    (source / "oops.txt").write_text("oops")
+    monkeypatch.setattr(deepkeep, "encrypt_file", lambda src, dest, cfg: (_ for _ in ()).throw(deepkeep.DeepKeepError("nope")))
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code != 0
+    assert " build finished in " in result.output
+    assert " encrypt failed in " in result.output
 
 
 def test_cli_uses_deepkeep_config_env_var(fake_crypto, repo: tuple[Path, Path, Path, Path], monkeypatch) -> None:

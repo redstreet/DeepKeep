@@ -13,8 +13,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,6 +25,7 @@ from typing import Iterable, Protocol
 import click
 import yaml
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 console = Console()
@@ -72,6 +75,119 @@ class Entry:
             "sha256": self.sha256,
             "mtime": self.mtime,
         }
+
+
+class ProgressReader:
+    def __init__(self, fh, callback):
+        self.fh = fh
+        self.callback = callback
+
+    def read(self, size=-1):
+        chunk = self.fh.read(size)
+        if chunk:
+            self.callback(len(chunk))
+        return chunk
+
+    def close(self):
+        return self.fh.close()
+
+
+class PackProgress:
+    def __init__(self, pack_id: str) -> None:
+        self.pack_id = pack_id
+        self.live_enabled = console.is_terminal
+
+    def _finish(self, stage: str, started_at: float, ok: bool = True) -> None:
+        outcome = "finished" if ok else "failed"
+        console.print(f"pack {self.pack_id} {stage} {outcome} in {self._format_duration(time.monotonic() - started_at)}")
+
+    def _format_duration(self, seconds: float) -> str:
+        total = int(seconds)
+        minutes, secs = divmod(total, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def build(self, total_bytes: int):
+        if not self.live_enabled:
+            return _NullBuildProgress(self)
+        progress = Progress(
+            TextColumn(f"pack {self.pack_id}"),
+            TextColumn("building"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        )
+        task_id = progress.add_task("building", total=max(total_bytes, 1), completed=0)
+        return _BuildProgress(self, progress, task_id)
+
+    @contextmanager
+    def stage(self, stage: str):
+        started_at = time.monotonic()
+        if self.live_enabled:
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn(f"pack {self.pack_id}"),
+                TextColumn(stage),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True,
+            )
+            task_id = progress.add_task(stage, total=None)
+            with progress:
+                try:
+                    yield
+                except Exception:
+                    self._finish(stage, started_at, ok=False)
+                    raise
+        else:
+            try:
+                yield
+            except Exception:
+                self._finish(stage, started_at, ok=False)
+                raise
+        self._finish(stage, started_at, ok=True)
+
+
+class _NullBuildProgress:
+    def __init__(self, owner: PackProgress) -> None:
+        self.owner = owner
+        self.started_at = 0.0
+
+    def __enter__(self):
+        self.started_at = time.monotonic()
+        return self
+
+    def advance(self, amount: int) -> None:
+        return
+
+    def __exit__(self, exc_type, exc, tb):
+        self.owner._finish("build", self.started_at, ok=exc is None)
+        return False
+
+
+class _BuildProgress:
+    def __init__(self, owner: PackProgress, progress: Progress, task_id: int) -> None:
+        self.owner = owner
+        self.progress = progress
+        self.task_id = task_id
+        self.started_at = 0.0
+
+    def __enter__(self):
+        self.started_at = time.monotonic()
+        self.progress.start()
+        return self
+
+    def advance(self, amount: int) -> None:
+        self.progress.advance(self.task_id, amount)
+
+    def __exit__(self, exc_type, exc, tb):
+        self.progress.stop()
+        self.owner._finish("build", self.started_at, ok=exc is None)
+        return False
 
 
 def utc_now() -> str:
@@ -436,7 +552,7 @@ def make_manifest(entries: list[Entry], created_at: str) -> dict[str, object]:
     }
 
 
-def write_tar(tar_path: Path, manifest: dict[str, object], entries: list[Entry]) -> None:
+def write_tar(tar_path: Path, manifest: dict[str, object], entries: list[Entry], on_progress=None) -> None:
     with tarfile.open(tar_path, "w") as tf:
         data = json.dumps(manifest, indent=2, sort_keys=True).encode()
         info = tarfile.TarInfo("MANIFEST.json")
@@ -444,7 +560,9 @@ def write_tar(tar_path: Path, manifest: dict[str, object], entries: list[Entry])
         info.mtime = int(datetime.now(UTC).timestamp())
         tf.addfile(info, io.BytesIO(data))
         for entry in entries:
-            tf.add(entry.source, arcname=entry.member_path, recursive=False)
+            with entry.source.open("rb") as fh:
+                tarinfo = tf.gettarinfo(str(entry.source), arcname=entry.member_path)
+                tf.addfile(tarinfo, fileobj=ProgressReader(fh, on_progress or (lambda _: None)))
 
 
 def pack_object_key(pack_id: str, created_at: str) -> str:
@@ -761,19 +879,23 @@ def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: Storag
     manifest = make_manifest(entries, str(state["created_at"]))
     tar_path = Path(str(state["tar_path"]))
     enc_path = Path(str(state["enc_path"]))
+    progress = PackProgress(str(state["pack_id"]))
     try:
-        write_tar(tar_path, manifest, entries)
+        with progress.build(sum(entry.size for entry in entries)) as build_progress:
+            write_tar(tar_path, manifest, entries, on_progress=build_progress.advance)
     except Exception as exc:
         raise wrap_error("pack build failed", exc) from exc
     write_stage(tar_path.parent / "state.json", state)
     try:
-        encrypt_file(tar_path, enc_path, config)
+        with progress.stage("encrypt"):
+            encrypt_file(tar_path, enc_path, config)
     except Exception as exc:
         raise wrap_error("pack encryption failed", exc) from exc
     state["status"] = "ENCRYPTED"
     write_stage(tar_path.parent / "state.json", state)
     try:
-        backend.put_object(str(state["object_key"]), str(enc_path))
+        with progress.stage("upload"):
+            backend.put_object(str(state["object_key"]), str(enc_path))
     except Exception as exc:
         raise wrap_error("pack upload failed", exc) from exc
     state["status"] = "UPLOADED"
