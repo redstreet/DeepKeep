@@ -634,6 +634,39 @@ def test_cli_reports_deepkeep_errors_cleanly(fake_crypto, repo: tuple[Path, Path
     assert "Traceback" not in result.output
 
 
+def test_backup_marks_run_failed_when_snapshot_errors(fake_crypto, repo: tuple[Path, Path, Path, Path], monkeypatch) -> None:
+    source, _, _, config = repo
+    (source / "fail.txt").write_text("data")
+    monkeypatch.setattr(deepkeep, "snapshot_catalog", lambda config, backend: (_ for _ in ()).throw(deepkeep.DeepKeepError("snapshot failed")))
+
+    result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code != 0
+    row = db_rows(config, "SELECT status, notes, files_new, packs_created FROM backup_runs ORDER BY started_at DESC")[0]
+    assert row[0] == "FAILED"
+    assert row[1] == "snapshot failed"
+    assert row[2] == 1
+    assert row[3] == 1
+
+
+def test_new_backup_marks_stale_running_rows_failed(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, _, _, config = repo
+    config_data = deepkeep.load_config(config)
+    db = deepkeep.connect_db(config_data)
+    db.execute(
+        "INSERT INTO backup_runs(run_id, started_at, machine, source_path, status) VALUES (?, ?, ?, ?, ?)",
+        ("stale123", "2026-04-09T03:17:38Z", "LIONLAP", "/tmp/source", "RUNNING"),
+    )
+    db.commit()
+    db.close()
+
+    (source / "fresh.txt").write_text("fresh")
+    result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert result.exit_code == 0, result.output
+    stale = db_rows(config, "SELECT status, notes FROM backup_runs WHERE run_id = 'stale123'")[0]
+    assert stale[0] == "FAILED"
+    assert "marked failed after a later backup detected an unfinished run" in stale[1]
+
+
 def test_restore_can_override_backend_source(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
     source, storage, localcopy, config = repo
     (source / "override.txt").write_text("from-glacier-layout")

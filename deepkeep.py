@@ -578,6 +578,49 @@ def stage_root(config: dict[str, object]) -> Path:
     return root
 
 
+def update_backup_run(
+    db: sqlite3.Connection,
+    run_id: str,
+    stats: dict[str, int],
+    *,
+    status: str,
+    notes: str | None = None,
+) -> None:
+    db.execute(
+        """
+        UPDATE backup_runs
+        SET completed_at = ?, files_scanned = ?, files_new = ?, files_deduped = ?, bytes_new = ?,
+            bytes_total_scanned = ?, packs_created = ?, status = ?, notes = ?
+        WHERE run_id = ?
+        """,
+        (
+            utc_now(),
+            stats["files_scanned"],
+            stats["files_new"],
+            stats["files_deduped"],
+            stats["bytes_new"],
+            stats["bytes_total_scanned"],
+            stats["packs_created"],
+            status,
+            notes,
+            run_id,
+        ),
+    )
+    db.commit()
+
+
+def fail_stale_runs(db: sqlite3.Connection) -> None:
+    db.execute(
+        """
+        UPDATE backup_runs
+        SET completed_at = COALESCE(completed_at, ?), status = ?, notes = COALESCE(notes, ?)
+        WHERE status = ?
+        """,
+        (utc_now(), "FAILED", "marked failed after a later backup detected an unfinished run", "RUNNING"),
+    )
+    db.commit()
+
+
 def snapshot_catalog(config: dict[str, object], backend: StorageBackend) -> None:
     catalog = Path(str(config["catalog_path"]))
     if not catalog.exists():
@@ -701,6 +744,7 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
     db = connect_db(config)
     backend = get_default_backend(config)
     resume_pending(config, db, backend)
+    fail_stale_runs(db)
     run_id = uuid.uuid4().hex[:12]
     started = utc_now()
     db.execute(
@@ -714,74 +758,60 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
     state, _ = new_pack_state(config, run_id, backend_name)
     current_size = 0
     run_hashes: set[str] = set()
-    for path in iter_files(source):
-        entry = build_entry(source, path)
-        previous = current_path_row(db, entry.rel_path)
-        stats["files_scanned"] += 1
-        stats["bytes_total_scanned"] += entry.size
-        upsert_file_path(db, entry)
-        if entry.sha256 in run_hashes or has_hash(db, entry.sha256):
-            stats["files_deduped"] += 1
-            if should_record_path_version(previous, entry):
-                blob = lookup_file_blob(db, entry.sha256)
-                record_path_version(
-                    db,
-                    path=entry.rel_path,
-                    sha256=entry.sha256,
-                    mtime=entry.mtime,
-                    run_id=run_id,
-                    recorded_at=started,
-                    pack_id=None if blob is None else blob["pack_id"],
-                )
-            continue
-        stats["files_new"] += 1
-        stats["bytes_new"] += entry.size
-        run_hashes.add(entry.sha256)
-        state["entries"].append(
-            {
-                "source": str(entry.source),
-                "original_path": entry.rel_path,
-                "member_path": entry.member_path,
-                "size": entry.size,
-                "sha256": entry.sha256,
-                "mtime": entry.mtime,
-            }
-        )
-        current_size += entry.size
-        if current_size >= target:
+    try:
+        for path in iter_files(source):
+            entry = build_entry(source, path)
+            previous = current_path_row(db, entry.rel_path)
+            stats["files_scanned"] += 1
+            stats["bytes_total_scanned"] += entry.size
+            upsert_file_path(db, entry)
+            if entry.sha256 in run_hashes or has_hash(db, entry.sha256):
+                stats["files_deduped"] += 1
+                if should_record_path_version(previous, entry):
+                    blob = lookup_file_blob(db, entry.sha256)
+                    record_path_version(
+                        db,
+                        path=entry.rel_path,
+                        sha256=entry.sha256,
+                        mtime=entry.mtime,
+                        run_id=run_id,
+                        recorded_at=started,
+                        pack_id=None if blob is None else blob["pack_id"],
+                    )
+                continue
+            stats["files_new"] += 1
+            stats["bytes_new"] += entry.size
+            run_hashes.add(entry.sha256)
+            state["entries"].append(
+                {
+                    "source": str(entry.source),
+                    "original_path": entry.rel_path,
+                    "member_path": entry.member_path,
+                    "size": entry.size,
+                    "sha256": entry.sha256,
+                    "mtime": entry.mtime,
+                }
+            )
+            current_size += entry.size
+            if current_size >= target:
+                stats["packs_created"] += 1
+                if not dry_run:
+                    seal_pack(config, db, backend, state)
+                state, _ = new_pack_state(config, run_id, backend_name)
+                current_size = 0
+        if state["entries"]:
             stats["packs_created"] += 1
             if not dry_run:
                 seal_pack(config, db, backend, state)
-            state, _ = new_pack_state(config, run_id, backend_name)
-            current_size = 0
-    if state["entries"]:
-        stats["packs_created"] += 1
         if not dry_run:
-            seal_pack(config, db, backend, state)
-    if not dry_run:
-        snapshot_catalog(config, backend)
-    db.execute(
-        """
-        UPDATE backup_runs
-        SET completed_at = ?, files_scanned = ?, files_new = ?, files_deduped = ?, bytes_new = ?,
-            bytes_total_scanned = ?, packs_created = ?, status = ?
-        WHERE run_id = ?
-        """,
-        (
-            utc_now(),
-            stats["files_scanned"],
-            stats["files_new"],
-            stats["files_deduped"],
-            stats["bytes_new"],
-            stats["bytes_total_scanned"],
-            stats["packs_created"],
-            "DRY_RUN" if dry_run else "COMPLETED",
-            run_id,
-        ),
-    )
-    db.commit()
-    db.close()
-    return stats
+            snapshot_catalog(config, backend)
+        update_backup_run(db, run_id, stats, status="DRY_RUN" if dry_run else "COMPLETED")
+        return stats
+    except Exception as exc:
+        update_backup_run(db, run_id, stats, status="FAILED", notes=str(exc))
+        raise
+    finally:
+        db.close()
 
 
 def fetch_pack(config: dict[str, object], backend: StorageBackend, object_key: str, workdir: Path) -> Path:
