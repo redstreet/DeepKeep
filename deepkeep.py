@@ -468,6 +468,10 @@ def require_tool(name: str) -> None:
     raise DeepKeepError(f"required executable not found on PATH: {name}")
 
 
+def expand_config_path(value: str) -> str:
+    return os.path.expanduser(os.path.expandvars(value))
+
+
 def load_config(path: Path) -> dict[str, object]:
     data = yaml.safe_load(path.read_text()) or {}
     if not isinstance(data, dict):
@@ -475,6 +479,8 @@ def load_config(path: Path) -> dict[str, object]:
     data.setdefault("pack_size_mb", PACK_MIN_MB)
     data.setdefault("catalog_path", str(path.with_suffix(".sqlite")))
     data.setdefault("work_root", str(path.parent / ".deepkeep-work"))
+    data["catalog_path"] = expand_config_path(str(data["catalog_path"]))
+    data["work_root"] = expand_config_path(str(data["work_root"]))
     if "age_pass_entry" not in data:
         raise DeepKeepError("config must define age_pass_entry")
     backends = data.get("backends")
@@ -490,6 +496,7 @@ def load_config(path: Path) -> dict[str, object]:
         if backend_type == "local":
             if "root" not in cfg:
                 raise DeepKeepError(f"config.backends.{name}.root is required for local backend")
+            cfg["root"] = expand_config_path(str(cfg["root"]))
         elif backend_type == "s3":
             for key in ("bucket", "prefix"):
                 if key not in cfg:

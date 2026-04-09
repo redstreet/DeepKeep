@@ -100,6 +100,36 @@ def test_load_config_requires_named_backends(tmp_path: Path) -> None:
         deepkeep.load_config(config)
 
 
+def test_load_config_expands_user_and_env_paths(tmp_path: Path, monkeypatch) -> None:
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    local_root = tmp_path / "storage"
+    monkeypatch.setenv("HOME", str(home_dir))
+    monkeypatch.setenv("DEEPKEEP_TEST_ROOT", str(local_root))
+    config = tmp_path / "deepkeep.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "default_backend: default",
+                "catalog_path: ~/catalog.sqlite",
+                "pack_size_mb: 1",
+                "age_pass_entry: backups/deepkeep",
+                "work_root: $DEEPKEEP_TEST_ROOT/work",
+                "backends:",
+                "  default:",
+                "    type: local",
+                "    root: $DEEPKEEP_TEST_ROOT/archive",
+            ]
+        )
+    )
+
+    loaded = deepkeep.load_config(config)
+
+    assert loaded["catalog_path"] == str(home_dir / "catalog.sqlite")
+    assert loaded["work_root"] == str(local_root / "work")
+    assert loaded["backends"]["default"]["root"] == str(local_root / "archive")
+
+
 def test_should_write_catalog_snapshot_weekly_policy() -> None:
     now = "2026-04-07T12:00:00Z"
     assert deepkeep.should_write_catalog_snapshot(now, []) is True
