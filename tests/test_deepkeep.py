@@ -725,6 +725,24 @@ def test_catalog_file_history_lists_versions(fake_crypto, repo: tuple[Path, Path
     assert result.output.count("FILE_VERSION\thistory.txt\t") == 2
 
 
+def test_verify_catalog_command_reports_consistency_issues(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, _, _, config = repo
+    (source / "verify.txt").write_text("hello")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code == 0, result.output
+
+    loaded = deepkeep.load_config(config)
+    db = deepkeep.connect_db(loaded)
+    db.execute("DELETE FROM packs")
+    db.commit()
+    db.close()
+
+    result = runner.invoke(deepkeep.cli, cli_args(config, "verify-catalog"))
+    assert result.exit_code == 1
+    assert "files reference missing packs rows" in result.output
+
+
 def test_restore_as_of_run_requires_known_run(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
     source, _, _, config = repo
     (source / "only.txt").write_text("one")
@@ -795,6 +813,23 @@ def test_backup_marks_run_failed_when_snapshot_errors(fake_crypto, repo: tuple[P
     assert row[1] == "catalog snapshot failed"
     assert row[2] == 1
     assert row[3] == 1
+
+
+def test_backup_marks_run_failed_when_quick_check_errors(fake_crypto, repo: tuple[Path, Path, Path, Path], monkeypatch) -> None:
+    source, _, _, config = repo
+    (source / "fail.txt").write_text("data")
+    monkeypatch.setattr(
+        deepkeep,
+        "quick_validate_catalog",
+        lambda db: (_ for _ in ()).throw(deepkeep.DeepKeepError("catalog quick check failed\ncorruption")),
+    )
+
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code != 0
+    assert "catalog quick check failed" in result.output
+    row = db_rows(config, "SELECT status, notes FROM backup_runs ORDER BY started_at DESC")[0]
+    assert row[0] == "FAILED"
+    assert row[1] == "catalog quick check failed"
 
 
 def test_new_backup_marks_stale_running_rows_failed(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:

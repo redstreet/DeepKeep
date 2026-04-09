@@ -623,6 +623,69 @@ def connect_db(config: dict[str, object]) -> sqlite3.Connection:
     return db
 
 
+def sqlite_check_issues(db: sqlite3.Connection, pragma: str) -> list[str]:
+    rows = db.execute(f"PRAGMA {pragma}").fetchall()
+    issues = [str(row[0]) for row in rows if row and str(row[0]) != "ok"]
+    return issues
+
+
+def quick_validate_catalog(db: sqlite3.Connection) -> None:
+    issues = sqlite_check_issues(db, "quick_check")
+    if issues:
+        raise DeepKeepError(f"catalog quick check failed\n" + "\n".join(issues))
+
+
+def catalog_reference_issues(db: sqlite3.Connection) -> list[str]:
+    queries = [
+        (
+            "file_paths reference missing files rows",
+            "SELECT COUNT(*) FROM file_paths fp LEFT JOIN files f ON f.sha256 = fp.sha256 WHERE f.sha256 IS NULL",
+        ),
+        (
+            "files reference missing packs rows",
+            "SELECT COUNT(*) FROM files f LEFT JOIN packs p ON p.pack_id = f.pack_id WHERE p.pack_id IS NULL",
+        ),
+        (
+            "run_files reference missing backup_runs rows",
+            "SELECT COUNT(*) FROM run_files rf LEFT JOIN backup_runs br ON br.run_id = rf.run_id WHERE br.run_id IS NULL",
+        ),
+        (
+            "run_files reference missing files rows",
+            "SELECT COUNT(*) FROM run_files rf LEFT JOIN files f ON f.sha256 = rf.sha256 WHERE f.sha256 IS NULL",
+        ),
+        (
+            "run_files reference missing packs rows",
+            "SELECT COUNT(*) FROM run_files rf LEFT JOIN packs p ON p.pack_id = rf.pack_id WHERE rf.pack_id IS NOT NULL AND p.pack_id IS NULL",
+        ),
+        (
+            "path_versions reference missing backup_runs rows",
+            "SELECT COUNT(*) FROM path_versions pv LEFT JOIN backup_runs br ON br.run_id = pv.run_id WHERE br.run_id IS NULL",
+        ),
+        (
+            "path_versions reference missing files rows",
+            "SELECT COUNT(*) FROM path_versions pv LEFT JOIN files f ON f.sha256 = pv.sha256 WHERE f.sha256 IS NULL",
+        ),
+        (
+            "path_versions reference missing packs rows",
+            "SELECT COUNT(*) FROM path_versions pv LEFT JOIN packs p ON p.pack_id = pv.pack_id WHERE pv.pack_id IS NOT NULL AND p.pack_id IS NULL",
+        ),
+    ]
+    issues: list[str] = []
+    for label, query in queries:
+        count = int(db.execute(query).fetchone()[0])
+        if count:
+            issues.append(f"{label}: {count}")
+    return issues
+
+
+def verify_catalog(config: dict[str, object]) -> list[str]:
+    db = connect_db(config)
+    try:
+        return sqlite_check_issues(db, "integrity_check") + catalog_reference_issues(db)
+    finally:
+        db.close()
+
+
 def upsert_file_path(db: sqlite3.Connection, entry: Entry) -> None:
     db.execute(
         "INSERT OR REPLACE INTO file_paths(path, sha256, mtime) VALUES (?, ?, ?)",
@@ -1087,6 +1150,7 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
                     seal_pack(config, db, backend, state, f"{next_pack_number}/{prescan['packs_estimated']}")
                 finally:
                     scan_progress.resume()
+        quick_validate_catalog(db)
         snapshot_catalog(config, backend)
         update_backup_run(db, run_id, stats, status="COMPLETED")
         return stats
@@ -1878,6 +1942,19 @@ def verify_pack_cmd(ctx: click.Context, verify_backend: str | None, pack_id: str
             console.print(f"[red]{issue}[/red]")
         raise SystemExit(1)
     console.print("pack verified")
+
+
+@cli.command("verify-catalog")
+@click.pass_context
+def verify_catalog_cmd(ctx: click.Context) -> None:
+    """Run paranoid SQLite and catalog consistency checks."""
+    config = current_config(ctx)
+    issues = verify_catalog(config)
+    if issues:
+        for issue in issues:
+            console.print(f"[red]{issue}[/red]")
+        raise SystemExit(1)
+    console.print("catalog verified")
 
 
 @cli.command("rebuild-catalog")
