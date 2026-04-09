@@ -1081,12 +1081,15 @@ def resume_pending(config: dict[str, object], db: sqlite3.Connection, backend: S
     for state_path in sorted(stage_root(config).glob("packs/*/state.json")):
         stage = read_stage(state_path)
         enc = stage.enc_file()
+        progress = PackProgress(stage.pack_id)
         if stage.status == "ENCRYPTED":
-            backend.put_object(stage.object_key, str(enc))
+            with progress.stage("upload"):
+                backend.put_object(stage.object_key, str(enc))
             stage.status = "UPLOADED"
             write_stage(state_path, stage)
         if stage.status == "UPLOADED":
-            commit_pack(db, stage)
+            with progress.stage("commit"):
+                commit_pack(db, stage)
             stage.status = "COMMITTED"
             write_stage(state_path, stage)
             shutil.rmtree(state_path.parent)

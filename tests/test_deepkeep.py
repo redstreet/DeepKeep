@@ -609,9 +609,17 @@ def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path], monke
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, dest)
 
+    seen: list[str] = []
+
+    def capture_print(*args, **kwargs) -> None:
+        seen.append(" ".join(str(arg) for arg in args))
+
+    monkeypatch.setattr(deepkeep.console, "print", capture_print)
     monkeypatch.setattr(backend, "put_object", copy_ok)
     committed = deepkeep.resume_pending(config, db, backend)
     assert committed == 1
+    assert any("upload" in line for line in seen)
+    assert any("commit" in line for line in seen)
     rows = db.execute("SELECT pack_id FROM packs").fetchall()
     assert len(rows) == 1
     run_rows = db.execute("SELECT path, pack_id FROM run_files").fetchall()
