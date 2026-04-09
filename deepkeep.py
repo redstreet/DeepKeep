@@ -190,6 +190,18 @@ def format_subprocess_error(exc: subprocess.CalledProcessError) -> str:
     return "\n".join(lines)
 
 
+def wrap_error(summary: str, exc: Exception) -> DeepKeepError:
+    details = str(exc).strip()
+    if not details:
+        return DeepKeepError(summary)
+    return DeepKeepError(f"{summary}\n{details}")
+
+
+def error_note(exc: Exception) -> str:
+    message = str(exc).strip()
+    return message.splitlines()[0] if message else "backup failed"
+
+
 def require_tool(name: str) -> None:
     if shutil.which(name):
         return
@@ -628,11 +640,17 @@ def snapshot_catalog(config: dict[str, object], backend: StorageBackend) -> None
     ts = utc_now()
     with tempfile.TemporaryDirectory() as tmp:
         enc = Path(tmp) / "catalog.sqlite.age"
-        encrypt_file(catalog, enc, config)
+        try:
+            encrypt_file(catalog, enc, config)
+        except Exception as exc:
+            raise wrap_error("catalog snapshot failed", exc) from exc
         latest_key, snap_key = catalog_object_keys(ts)
-        backend.put_object(latest_key, str(enc))
-        if should_write_catalog_snapshot(ts, backend.list_objects("catalog/snapshots")):
-            backend.put_object(snap_key, str(enc))
+        try:
+            backend.put_object(latest_key, str(enc))
+            if should_write_catalog_snapshot(ts, backend.list_objects("catalog/snapshots")):
+                backend.put_object(snap_key, str(enc))
+        except Exception as exc:
+            raise wrap_error("catalog snapshot failed", exc) from exc
 
 
 def commit_pack(db: sqlite3.Connection, stage: dict[str, object]) -> None:
@@ -728,15 +746,27 @@ def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: Storag
     manifest = make_manifest(entries, str(state["created_at"]))
     tar_path = Path(str(state["tar_path"]))
     enc_path = Path(str(state["enc_path"]))
-    write_tar(tar_path, manifest, entries)
+    try:
+        write_tar(tar_path, manifest, entries)
+    except Exception as exc:
+        raise wrap_error("pack build failed", exc) from exc
     write_stage(tar_path.parent / "state.json", state)
-    encrypt_file(tar_path, enc_path, config)
+    try:
+        encrypt_file(tar_path, enc_path, config)
+    except Exception as exc:
+        raise wrap_error("pack encryption failed", exc) from exc
     state["status"] = "ENCRYPTED"
     write_stage(tar_path.parent / "state.json", state)
-    backend.put_object(str(state["object_key"]), str(enc_path))
+    try:
+        backend.put_object(str(state["object_key"]), str(enc_path))
+    except Exception as exc:
+        raise wrap_error("pack upload failed", exc) from exc
     state["status"] = "UPLOADED"
     write_stage(tar_path.parent / "state.json", state)
-    commit_pack(db, state)
+    try:
+        commit_pack(db, state)
+    except Exception as exc:
+        raise wrap_error("pack commit failed", exc) from exc
     shutil.rmtree(tar_path.parent)
 
 
@@ -808,7 +838,7 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
         update_backup_run(db, run_id, stats, status="DRY_RUN" if dry_run else "COMPLETED")
         return stats
     except Exception as exc:
-        update_backup_run(db, run_id, stats, status="FAILED", notes=str(exc))
+        update_backup_run(db, run_id, stats, status="FAILED", notes=error_note(exc))
         raise
     finally:
         db.close()

@@ -637,13 +637,17 @@ def test_cli_reports_deepkeep_errors_cleanly(fake_crypto, repo: tuple[Path, Path
 def test_backup_marks_run_failed_when_snapshot_errors(fake_crypto, repo: tuple[Path, Path, Path, Path], monkeypatch) -> None:
     source, _, _, config = repo
     (source / "fail.txt").write_text("data")
-    monkeypatch.setattr(deepkeep, "snapshot_catalog", lambda config, backend: (_ for _ in ()).throw(deepkeep.DeepKeepError("snapshot failed")))
+    monkeypatch.setattr(
+        deepkeep,
+        "snapshot_catalog",
+        lambda config, backend: (_ for _ in ()).throw(deepkeep.DeepKeepError("catalog snapshot failed\nstderr:\nboom")),
+    )
 
     result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
     assert result.exit_code != 0
     row = db_rows(config, "SELECT status, notes, files_new, packs_created FROM backup_runs ORDER BY started_at DESC")[0]
     assert row[0] == "FAILED"
-    assert row[1] == "snapshot failed"
+    assert row[1] == "catalog snapshot failed"
     assert row[2] == 1
     assert row[3] == 1
 
