@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
@@ -34,10 +35,22 @@ ISO = "%Y-%m-%dT%H:%M:%SZ"
 PACK_MIN_MB = 512
 SNAPSHOT_NAME = "catalog/snapshots/catalog-"
 WEEK_SECONDS = 7 * 24 * 60 * 60
+GZIP_MAGIC = b"\x1f\x8b"
 
 
 class DeepKeepError(RuntimeError):
     pass
+
+
+@dataclass
+class CatalogDbState:
+    temp_dir: Path
+    temp_path: Path
+    catalog_path: Path
+    persist: bool
+
+
+CATALOG_DB_STATE: dict[int, CatalogDbState] = {}
 
 
 class DeepKeepCLI(click.Group):
@@ -341,7 +354,7 @@ def parse_utc(value: str) -> datetime:
 
 def parse_snapshot_key(key: str) -> datetime | None:
     prefix = SNAPSHOT_NAME
-    suffix = ".sqlite.age"
+    suffix = ".sqlite.gz.age"
     if not key.startswith(prefix) or not key.endswith(suffix):
         return None
     raw = key[len(prefix) : -len(suffix)]
@@ -510,7 +523,7 @@ def load_config(path: Path) -> dict[str, object]:
     if not isinstance(data, dict):
         raise DeepKeepError("config must be a YAML mapping")
     data.setdefault("pack_size_mb", PACK_MIN_MB)
-    data.setdefault("catalog_path", str(path.with_suffix(".sqlite")))
+    data.setdefault("catalog_path", str(path.with_suffix(".sqlite.gz")))
     data.setdefault("work_root", str(path.parent / ".deepkeep-work"))
     data["catalog_path"] = expand_config_path(str(data["catalog_path"]))
     data["work_root"] = expand_config_path(str(data["work_root"]))
@@ -575,10 +588,59 @@ def decrypt_file(src: Path, dest: Path, config: dict[str, object]) -> None:
         raise DeepKeepError(proc.stderr.strip() or "age decryption failed")
 
 
-def connect_db(config: dict[str, object]) -> sqlite3.Connection:
+def is_gzip_file(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size < 2:
+        return False
+    with path.open("rb") as fh:
+        return fh.read(2) == GZIP_MAGIC
+
+
+def write_gzip_file(src: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    with src.open("rb") as inp, gzip.open(tmp, "wb") as out:
+        shutil.copyfileobj(inp, out)
+    tmp.replace(dest)
+
+
+def prepare_catalog_db(catalog_path: Path) -> tuple[Path, Path]:
+    temp_dir = Path(tempfile.mkdtemp(prefix="deepkeep-catalog-"))
+    temp_path = temp_dir / "catalog.sqlite"
+    if catalog_path.exists():
+        if is_gzip_file(catalog_path):
+            with gzip.open(catalog_path, "rb") as inp, temp_path.open("wb") as out:
+                shutil.copyfileobj(inp, out)
+        else:
+            shutil.copyfile(catalog_path, temp_path)
+    return temp_dir, temp_path
+
+
+def sync_catalog_db(db: sqlite3.Connection) -> None:
+    state = CATALOG_DB_STATE.get(id(db))
+    if state is None or not state.persist:
+        return
+    db.commit()
+    write_gzip_file(state.temp_path, state.catalog_path)
+
+
+def close_db(db: sqlite3.Connection) -> None:
+    state = CATALOG_DB_STATE.get(id(db))
+    try:
+        if state is not None and state.persist:
+            sync_catalog_db(db)
+    finally:
+        CATALOG_DB_STATE.pop(id(db), None)
+        db.close()
+        if state is not None:
+            shutil.rmtree(state.temp_dir, ignore_errors=True)
+
+
+def connect_db(config: dict[str, object], *, persist: bool = True) -> sqlite3.Connection:
     catalog_path = Path(str(config["catalog_path"]))
     catalog_path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(catalog_path))
+    temp_dir, temp_path = prepare_catalog_db(catalog_path)
+    db = sqlite3.connect(str(temp_path))
+    CATALOG_DB_STATE[id(db)] = CatalogDbState(temp_dir=temp_dir, temp_path=temp_path, catalog_path=catalog_path, persist=persist)
     db.row_factory = sqlite3.Row
     db.executescript(
         """
@@ -704,20 +766,20 @@ def catalog_reference_issues(db: sqlite3.Connection) -> list[str]:
 
 
 def verify_catalog(config: dict[str, object]) -> list[str]:
-    db = connect_db(config)
+    db = connect_db(config, persist=False)
     try:
         return sqlite_check_issues(db, "integrity_check") + catalog_reference_issues(db)
     finally:
-        db.close()
+        close_db(db)
 
 
 def catalog_backend_label(config: dict[str, object]) -> str:
-    db = connect_db(config)
+    db = connect_db(config, persist=False)
     try:
         row = db.execute("SELECT value FROM settings WHERE key = ?", ("catalog_backend_label",)).fetchone()
         return current_backend_label(config) if row is None else str(row["value"])
     finally:
-        db.close()
+        close_db(db)
 
 
 def backend_identity(config: dict[str, object]) -> str:
@@ -851,7 +913,7 @@ def pack_object_key(pack_id: str, created_at: str) -> str:
 
 
 def catalog_object_keys(ts: str) -> tuple[str, str]:
-    return "catalog/latest.sqlite.age", f"catalog/snapshots/catalog-{ts.replace(':', '').replace('-', '')}.sqlite.age"
+    return "catalog/latest.sqlite.gz.age", f"catalog/snapshots/catalog-{ts.replace(':', '').replace('-', '')}.sqlite.gz.age"
 
 
 def read_stage(path: Path) -> StagedPack:
@@ -1063,13 +1125,15 @@ def fail_stale_runs(db: sqlite3.Connection) -> None:
     db.commit()
 
 
-def snapshot_catalog(config: dict[str, object], backend: StorageBackend) -> None:
+def snapshot_catalog(config: dict[str, object], backend: StorageBackend, db: sqlite3.Connection | None = None) -> None:
+    if db is not None:
+        sync_catalog_db(db)
     catalog = Path(str(config["catalog_path"]))
     if not catalog.exists():
         return
     ts = utc_now()
     with tempfile.TemporaryDirectory() as tmp:
-        enc = Path(tmp) / "catalog.sqlite.age"
+        enc = Path(tmp) / "catalog.sqlite.gz.age"
         try:
             encrypt_file(catalog, enc, config)
         except Exception as exc:
@@ -1195,10 +1259,10 @@ def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: Storag
 
 
 def backup_source(config: dict[str, object], source: Path, dry_run: bool = False) -> dict[str, int]:
-    db = connect_db(config)
+    db = connect_db(config, persist=not dry_run)
     if dry_run:
         planned = plan_backup(db, config, source)
-        db.close()
+        close_db(db)
         return planned
     prescan = pre_scan_source(config, source)
 
@@ -1259,7 +1323,7 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
                 finally:
                     scan_progress.resume()
         quick_validate_catalog(db)
-        snapshot_catalog(config, backend)
+        snapshot_catalog(config, backend, db)
         update_backup_run(db, run_id, stats, status="COMPLETED")
         return stats
     except Exception as exc:
@@ -1267,7 +1331,7 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
         update_backup_run(db, run_id, stats, status=status, notes=error_note(exc))
         raise
     finally:
-        db.close()
+        close_db(db)
 
 
 def plan_backup(
@@ -1554,7 +1618,7 @@ def restore_prefixes(
     no_hardlinks: bool = False,
     as_of_run: str | None = None,
 ) -> tuple[int, int]:
-    db = connect_db(config)
+    db = connect_db(config, persist=False)
     try:
         matches = select_restore_rows(db, prefixes, restore_all, as_of_run)
         if not matches:
@@ -1586,70 +1650,77 @@ def restore_prefixes(
                     )
         return restored, pending
     finally:
-        db.close()
+        close_db(db)
 
 
 def verify_pack(config: dict[str, object], pack_id: str) -> list[str]:
-    db = connect_db(config)
-    row = db.execute("SELECT object_key FROM packs WHERE pack_id = ?", (pack_id,)).fetchone()
-    if row is None:
-        raise DeepKeepError(f"unknown pack_id: {pack_id}")
-    backend = get_backend(config)
-    issues: list[str] = []
-    with tempfile.TemporaryDirectory() as tmp:
-        tar_path = fetch_pack(config, backend, row["object_key"], Path(tmp))
-        manifest = read_manifest_from_tar(tar_path)
-        with tarfile.open(tar_path) as tf:
-            for item in manifest["files"]:
-                member = tf.extractfile(item["member_path"])
-                if member is None:
-                    issues.append(f"missing member {item['member_path']}")
-                    continue
-                digest = hashlib.sha256(member.read()).hexdigest()
-                if digest != item["sha256"]:
-                    issues.append(f"hash mismatch for {item['original_path']}")
-    return issues
+    db = connect_db(config, persist=False)
+    try:
+        row = db.execute("SELECT object_key FROM packs WHERE pack_id = ?", (pack_id,)).fetchone()
+        if row is None:
+            raise DeepKeepError(f"unknown pack_id: {pack_id}")
+        backend = get_backend(config)
+        issues: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            tar_path = fetch_pack(config, backend, row["object_key"], Path(tmp))
+            manifest = read_manifest_from_tar(tar_path)
+            with tarfile.open(tar_path) as tf:
+                for item in manifest["files"]:
+                    member = tf.extractfile(item["member_path"])
+                    if member is None:
+                        issues.append(f"missing member {item['member_path']}")
+                        continue
+                    digest = hashlib.sha256(member.read()).hexdigest()
+                    if digest != item["sha256"]:
+                        issues.append(f"hash mismatch for {item['original_path']}")
+        return issues
+    finally:
+        close_db(db)
 
 
 def rebuild_catalog(config: dict[str, object]) -> int:
     db = connect_db(config)
     backend = get_backend(config)
-    db.execute("DELETE FROM file_paths")
-    db.execute("DELETE FROM files")
-    db.execute("DELETE FROM packs")
-    db.execute("DELETE FROM path_versions")
-    db.commit()
-    count = 0
-    with tempfile.TemporaryDirectory() as tmp:
-        tmpdir = Path(tmp)
-        for key in backend.list_objects("packs"):
-            tar_path = fetch_pack(config, backend, key, tmpdir)
-            manifest = read_manifest_from_tar(tar_path)
-            name = Path(key).name
-            pack_id = name.split("pack-")[-1].split(".tar.age")[0]
-            created_at = str(manifest.get("created_at", utc_now()))
-            db.execute(
-                "INSERT OR REPLACE INTO packs(pack_id, object_key, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (pack_id, key, created_at, "off", "age", 1, "rebuild"),
-            )
-            for item in manifest["files"]:
-                db.execute(
-                    "INSERT OR IGNORE INTO files(sha256, size, pack_id, tar_path) VALUES (?, ?, ?, ?)",
-                    (item["sha256"], item["size"], pack_id, item["member_path"]),
-                )
-                db.execute(
-                    "INSERT OR REPLACE INTO file_paths(path, sha256, mtime) VALUES (?, ?, ?)",
-                    (item["original_path"], item["sha256"], item.get("mtime")),
-                )
-            count += 1
-        db.execute("DELETE FROM run_files")
+    try:
+        db.execute("DELETE FROM file_paths")
+        db.execute("DELETE FROM files")
+        db.execute("DELETE FROM packs")
         db.execute("DELETE FROM path_versions")
         db.commit()
-    return count
+        count = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            for key in backend.list_objects("packs"):
+                tar_path = fetch_pack(config, backend, key, tmpdir)
+                manifest = read_manifest_from_tar(tar_path)
+                name = Path(key).name
+                pack_id = name.split("pack-")[-1].split(".tar.age")[0]
+                created_at = str(manifest.get("created_at", utc_now()))
+                db.execute(
+                    "INSERT OR REPLACE INTO packs(pack_id, object_key, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (pack_id, key, created_at, "off", "age", 1, "rebuild"),
+                )
+                for item in manifest["files"]:
+                    db.execute(
+                        "INSERT OR IGNORE INTO files(sha256, size, pack_id, tar_path) VALUES (?, ?, ?, ?)",
+                        (item["sha256"], item["size"], pack_id, item["member_path"]),
+                    )
+                    db.execute(
+                        "INSERT OR REPLACE INTO file_paths(path, sha256, mtime) VALUES (?, ?, ?)",
+                        (item["original_path"], item["sha256"], item.get("mtime")),
+                    )
+                count += 1
+            db.execute("DELETE FROM run_files")
+            db.execute("DELETE FROM path_versions")
+            db.commit()
+        return count
+    finally:
+        close_db(db)
+    
 
 
 def catalog_summary(config: dict[str, object]) -> sqlite3.Row:
-    db = connect_db(config)
+    db = connect_db(config, persist=False)
     row = db.execute(
         """
         SELECT
@@ -1663,12 +1734,12 @@ def catalog_summary(config: dict[str, object]) -> sqlite3.Row:
         """,
         (catalog_backend_label(config),),
     ).fetchone()
-    db.close()
+    close_db(db)
     return row
 
 
 def catalog_runs(config: dict[str, object]) -> list[sqlite3.Row]:
-    db = connect_db(config)
+    db = connect_db(config, persist=False)
     rows = db.execute(
         """
         SELECT run_id, started_at, completed_at, machine, source_path, files_scanned, files_new, files_deduped,
@@ -1677,12 +1748,12 @@ def catalog_runs(config: dict[str, object]) -> list[sqlite3.Row]:
         ORDER BY started_at DESC
         """
     ).fetchall()
-    db.close()
+    close_db(db)
     return rows
 
 
 def catalog_run_detail(config: dict[str, object], run_id: str) -> tuple[sqlite3.Row | None, list[sqlite3.Row], list[sqlite3.Row]]:
-    db = connect_db(config)
+    db = connect_db(config, persist=False)
     run_row = db.execute(
         """
         SELECT run_id, started_at, completed_at, machine, source_path, files_scanned, files_new, files_deduped,
@@ -1712,12 +1783,12 @@ def catalog_run_detail(config: dict[str, object], run_id: str) -> tuple[sqlite3.
         """,
         (run_id,),
     ).fetchall()
-    db.close()
+    close_db(db)
     return run_row, pack_rows, file_rows
 
 
 def catalog_files(config: dict[str, object], prefix: str | None = None, pack_id: str | None = None, run_id: str | None = None) -> list[sqlite3.Row]:
-    db = connect_db(config)
+    db = connect_db(config, persist=False)
     sql = [
         """
         SELECT fp.path, f.size, fp.mtime, f.pack_id, rf.run_id
@@ -1741,12 +1812,12 @@ def catalog_files(config: dict[str, object], prefix: str | None = None, pack_id:
         sql.append("WHERE " + " AND ".join(conditions))
     sql.append("ORDER BY fp.path")
     rows = db.execute("\n".join(sql), params).fetchall()
-    db.close()
+    close_db(db)
     return rows
 
 
 def catalog_packs(config: dict[str, object]) -> list[sqlite3.Row]:
-    db = connect_db(config)
+    db = connect_db(config, persist=False)
     rows = db.execute(
         """
         SELECT p.pack_id, p.created_at, p.object_key, p.run_id, COUNT(f.sha256) AS file_count, COALESCE(SUM(f.size), 0) AS total_bytes
@@ -1756,12 +1827,12 @@ def catalog_packs(config: dict[str, object]) -> list[sqlite3.Row]:
         ORDER BY p.created_at DESC, p.pack_id DESC
         """
     ).fetchall()
-    db.close()
+    close_db(db)
     return rows
 
 
 def catalog_file_detail(config: dict[str, object], path: str) -> sqlite3.Row | None:
-    db = connect_db(config)
+    db = connect_db(config, persist=False)
     row = db.execute(
         """
         SELECT fp.path, f.size, fp.mtime, fp.sha256, f.pack_id, f.tar_path,
@@ -1774,12 +1845,12 @@ def catalog_file_detail(config: dict[str, object], path: str) -> sqlite3.Row | N
         """,
         (path,),
     ).fetchone()
-    db.close()
+    close_db(db)
     return row
 
 
 def catalog_file_history(config: dict[str, object], path: str) -> list[sqlite3.Row]:
-    db = connect_db(config)
+    db = connect_db(config, persist=False)
     rows = db.execute(
         """
         SELECT pv.path, f.size, pv.mtime, pv.sha256, f.pack_id, pv.run_id, pv.recorded_at
@@ -1790,7 +1861,7 @@ def catalog_file_history(config: dict[str, object], path: str) -> list[sqlite3.R
         """,
         (path,),
     ).fetchall()
-    db.close()
+    close_db(db)
     return rows
 
 
@@ -2105,7 +2176,7 @@ def upload_catalog_cmd(ctx: click.Context) -> None:
     try:
         quick_validate_catalog(db)
     finally:
-        db.close()
+        close_db(db)
     snapshot_catalog(config, get_backend(config))
     completed_at = datetime.now().astimezone()
     console.print(f"Completed: {format_local_timestamp(completed_at)}  total time taken for catalog upload: {format_duration((completed_at - started_at).total_seconds())}")

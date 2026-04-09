@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 import shutil
 import socket
-import sqlite3
 import sys
 import tarfile
+import gzip
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -45,11 +45,12 @@ def repo(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 def db_rows(config: Path, sql: str):
-    db = sqlite3.connect(str(config.parent / "catalog.sqlite"))
+    loaded = deepkeep.load_config(config)
+    db = deepkeep.connect_db(loaded, persist=False)
     try:
         return db.execute(sql).fetchall()
     finally:
-        db.close()
+        deepkeep.close_db(db)
 
 
 def cli_args(config: Path, *args: str) -> list[str]:
@@ -124,15 +125,15 @@ def test_should_write_catalog_snapshot_weekly_policy() -> None:
     assert deepkeep.should_write_catalog_snapshot(now, []) is True
     assert deepkeep.should_write_catalog_snapshot(
         now,
-        ["catalog/snapshots/catalog-20260401T120000Z.sqlite.age"],
+        ["catalog/snapshots/catalog-20260401T120000Z.sqlite.gz.age"],
     ) is False
     assert deepkeep.should_write_catalog_snapshot(
         now,
-        ["catalog/snapshots/catalog-20260331T115959Z.sqlite.age"],
+        ["catalog/snapshots/catalog-20260331T115959Z.sqlite.gz.age"],
     ) is True
     assert deepkeep.should_write_catalog_snapshot(
         now,
-        ["catalog/snapshots/not-a-timestamp.sqlite.age"],
+        ["catalog/snapshots/not-a-timestamp.sqlite.gz.age"],
     ) is True
 
 
@@ -152,7 +153,7 @@ def test_snapshot_catalog_writes_latest_every_run_but_weekly_snapshots(tmp_path:
     monkeypatch.setattr(deepkeep, "utc_now", lambda: "2026-04-07T12:00:00Z")
 
     deepkeep.snapshot_catalog(config, backend)
-    latest = storage / "catalog" / "latest.sqlite.age"
+    latest = storage / "catalog" / "latest.sqlite.gz.age"
     snapshots = sorted((storage / "catalog" / "snapshots").glob("*.age"))
     assert latest.exists()
     assert len(snapshots) == 1
@@ -184,7 +185,19 @@ def test_upload_catalog_command_runs_quick_check_and_uploads(fake_crypto, repo: 
     assert "Started:" in result.output
     assert "Completed:" in result.output
     assert "catalog upload" in result.output
-    assert (storage / "catalog" / "latest.sqlite.age").exists()
+    assert (storage / "catalog" / "latest.sqlite.gz.age").exists()
+
+
+def test_backup_writes_local_catalog_as_gzip(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, _storage, config = repo
+    (source / "one.txt").write_text("one")
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code == 0, result.output
+
+    catalog = config.parent / "catalog.sqlite"
+    with gzip.open(catalog, "rb") as fh:
+        header = fh.read(16)
+    assert header.startswith(b"SQLite format 3")
 
 
 def test_s3_list_objects_returns_empty_for_missing_prefix(monkeypatch) -> None:
@@ -291,7 +304,7 @@ def test_dry_run_does_not_bind_backend_identity(fake_crypto, repo: tuple[Path, P
     loaded = deepkeep.load_config(config)
     db = deepkeep.connect_db(loaded)
     row = db.execute("SELECT value FROM settings WHERE key = 'catalog_backend_identity'").fetchone()
-    db.close()
+    deepkeep.close_db(db)
     assert row is None
 
 
@@ -649,7 +662,7 @@ def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path], monke
     run_rows = db.execute("SELECT path, pack_id FROM run_files").fetchall()
     assert len(run_rows) == 1
     assert run_rows[0][0] == "resume.txt"
-    db.close()
+    deepkeep.close_db(db)
 
 
 def test_backup_rerun_after_failed_upload_reports_resume_scan(fake_crypto, repo: tuple[Path, Path, Path], monkeypatch) -> None:
@@ -828,7 +841,7 @@ def test_verify_catalog_command_reports_consistency_issues(fake_crypto, repo: tu
     db = deepkeep.connect_db(loaded)
     db.execute("DELETE FROM packs")
     db.commit()
-    db.close()
+    deepkeep.close_db(db)
 
     result = runner.invoke(deepkeep.cli, cli_args(config, "verify-catalog"))
     assert result.exit_code == 1
@@ -893,7 +906,7 @@ def test_backup_marks_run_failed_when_snapshot_errors(fake_crypto, repo: tuple[P
     monkeypatch.setattr(
         deepkeep,
         "snapshot_catalog",
-        lambda config, backend: (_ for _ in ()).throw(deepkeep.DeepKeepError("catalog snapshot failed\nstderr:\nboom")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(deepkeep.DeepKeepError("catalog snapshot failed\nstderr:\nboom")),
     )
 
     result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
@@ -933,7 +946,7 @@ def test_new_backup_marks_stale_running_rows_failed(fake_crypto, repo: tuple[Pat
         ("stale123", "2026-04-09T03:17:38Z", "LIONLAP", "/tmp/source", "RUNNING"),
     )
     db.commit()
-    db.close()
+    deepkeep.close_db(db)
 
     (source / "fresh.txt").write_text("fresh")
     result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
@@ -956,7 +969,7 @@ def test_new_backup_marks_stale_running_rows_partial_when_committed_packs_exist(
         ("pack123", "packs/2026/04/pack-pack123.tar.age", "2026-04-09T03:18:00Z", "off", "age", 1, "partial123"),
     )
     db.commit()
-    db.close()
+    deepkeep.close_db(db)
 
     (source / "fresh.txt").write_text("fresh")
     result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))

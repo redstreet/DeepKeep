@@ -75,7 +75,7 @@ The first real backup binds the catalog to that exact backend config. If you lat
 ## Local Backend Example
 
 ```yaml
-catalog_path: /path/to/catalog.sqlite
+catalog_path: /path/to/catalog.sqlite.gz
 pack_size_mb: 512
 age_pass_entry: backups/deepkeep
 work_root: /path/to/work
@@ -88,7 +88,7 @@ backend:
 ## S3 Backend Example
 
 ```yaml
-catalog_path: /path/to/catalog.sqlite
+catalog_path: /path/to/catalog.sqlite.gz
 pack_size_mb: 512
 age_pass_entry: backups/deepkeep
 work_root: /path/to/work
@@ -172,7 +172,7 @@ aws s3 ls
 3. Create a config file, for example `deepkeep.yaml`:
 
 ```yaml
-catalog_path: /absolute/path/to/catalog.sqlite
+catalog_path: /absolute/path/to/catalog.sqlite.gz
 pack_size_mb: 512
 age_pass_entry: backups/deepkeep
 work_root: /absolute/path/to/work
@@ -218,13 +218,13 @@ DeepKeep stores objects like this:
 
 ```text
 packs/YYYY/MM/pack-<id>.tar.age
-catalog/latest.sqlite.age
-catalog/snapshots/catalog-<timestamp>.sqlite.age
+catalog/latest.sqlite.gz.age
+catalog/snapshots/catalog-<timestamp>.sqlite.gz.age
 ```
 
 Notes:
 
-- `catalog/latest.sqlite.age` is uploaded on every successful backup
+- `catalog/latest.sqlite.gz.age` is uploaded on every successful backup
 - historical catalog snapshots are uploaded at most once per week
 - under the current implementation, catalog objects use the same backend and storage class as pack objects
 
