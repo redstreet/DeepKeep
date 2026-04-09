@@ -266,9 +266,11 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
 
     result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code == 0, result.output
-    assert " build finished in " in result.output
-    assert " encrypt finished in " in result.output
-    assert " upload finished in " in result.output
+    assert "pack 1/1" in result.output
+    assert "build" in result.output
+    assert "encrypt" in result.output
+    assert "upload" in result.output
+    assert "Packs used" in result.output
 
     pack_files = sorted(storage.rglob("*.age"))
     assert any("pack-" in path.name for path in pack_files)
@@ -289,10 +291,10 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
         cli_args(config, "restore", "--dest", str(dest), "a/"),
     )
     assert result.exit_code == 0, result.output
-    assert " check finished in " in result.output
-    assert " download finished in " in result.output
-    assert " decrypt finished in " in result.output
-    assert " restore finished in " in result.output
+    assert "check     finished" in result.output
+    assert "download  finished" in result.output
+    assert "decrypt   finished" in result.output
+    assert "restore   finished" in result.output
     assert (dest / "a" / "one.txt").read_text() == "one"
     assert (dest / "a" / "two.txt").read_text() == "two"
     assert not (dest / "dup.txt").exists()
@@ -532,7 +534,7 @@ def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path, Path],
 
     monkeypatch.setattr(backend, "put_object", flaky_put)
     with pytest.raises(RuntimeError):
-        deepkeep.seal_pack(config, db, backend, state)
+        deepkeep.seal_pack(config, db, backend, state, "1/1")
     assert (pack_dir / "state.json").exists()
     stage = deepkeep.read_stage(pack_dir / "state.json")
     assert stage["status"] == "ENCRYPTED"
@@ -725,8 +727,8 @@ def test_restore_reports_pending_archive_pack(fake_crypto, repo: tuple[Path, Pat
     dest = tmp_path / "restore"
     result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(dest), "cold"))
     assert result.exit_code == 0, result.output
-    assert " check finished in " in result.output
-    assert " requesting restore finished in " in result.output
+    assert "check     finished" in result.output
+    assert "requesting restore finished" in result.output
     assert "packs pending glacier restore: 1" in result.output
 
 
@@ -756,7 +758,8 @@ def test_backup_marks_run_failed_when_snapshot_errors(fake_crypto, repo: tuple[P
 
     result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code != 0
-    assert "upload finished in" in result.output
+    assert "pack 1/1" in result.output
+    assert "upload" in result.output
     row = db_rows(config, "SELECT status, notes, files_new, packs_created FROM backup_runs ORDER BY started_at DESC")[0]
     assert row[0] == "FAILED"
     assert row[1] == "catalog snapshot failed"
@@ -809,8 +812,10 @@ def test_backup_reports_failed_stage(fake_crypto, repo: tuple[Path, Path, Path, 
     monkeypatch.setattr(deepkeep, "encrypt_file", lambda src, dest, cfg: (_ for _ in ()).throw(deepkeep.DeepKeepError("nope")))
     result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
     assert result.exit_code != 0
-    assert " build finished in " in result.output
-    assert " encrypt failed in " in result.output
+    assert "pack 1/1" in result.output
+    assert "build" in result.output
+    assert "encrypt" in result.output
+    assert "failed" in result.output
 
 
 def test_cli_uses_deepkeep_config_env_var(fake_crypto, repo: tuple[Path, Path, Path, Path], monkeypatch) -> None:

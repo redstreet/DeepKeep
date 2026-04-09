@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import os
 import shlex
 import shutil
@@ -93,13 +94,13 @@ class ProgressReader:
 
 
 class PackProgress:
-    def __init__(self, pack_id: str) -> None:
-        self.pack_id = pack_id
+    def __init__(self, pack_label: str) -> None:
+        self.pack_label = pack_label
         self.live_enabled = console.is_terminal
 
     def _finish(self, stage: str, started_at: float, ok: bool = True) -> None:
         outcome = "finished" if ok else "failed"
-        console.print(f"pack {self.pack_id} {stage} {outcome} in {self._format_duration(time.monotonic() - started_at)}")
+        console.print(f"pack {self.pack_label:<8} {stage:<9} {outcome:<8} {self._format_duration(time.monotonic() - started_at)}")
 
     def _format_duration(self, seconds: float) -> str:
         total = int(seconds)
@@ -113,7 +114,7 @@ class PackProgress:
         if not self.live_enabled:
             return _NullBarProgress(self, "build")
         progress = Progress(
-            TextColumn(f"pack {self.pack_id}"),
+            TextColumn(f"pack {self.pack_label}"),
             TextColumn("building"),
             BarColumn(),
             TaskProgressColumn(),
@@ -128,7 +129,7 @@ class PackProgress:
         if not self.live_enabled:
             return _NullBarProgress(self, "restore")
         progress = Progress(
-            TextColumn(f"pack {self.pack_id}"),
+            TextColumn(f"pack {self.pack_label}"),
             TextColumn("restoring"),
             BarColumn(),
             TaskProgressColumn(),
@@ -145,7 +146,7 @@ class PackProgress:
         if self.live_enabled:
             progress = Progress(
                 SpinnerColumn(),
-                TextColumn(f"pack {self.pack_id}"),
+                TextColumn(f"pack {self.pack_label}"),
                 TextColumn(stage),
                 TimeElapsedColumn(),
                 console=console,
@@ -204,6 +205,38 @@ class _BarProgress:
     def __exit__(self, exc_type, exc, tb):
         self.progress.stop()
         self.owner._finish(self.stage, self.started_at, ok=exc is None)
+        return False
+
+
+class ScanProgress:
+    def __init__(self, total_bytes: int) -> None:
+        self.total_bytes = total_bytes
+        self.live_enabled = console.is_terminal
+        self.progress = None
+        self.task_id = None
+
+    def __enter__(self):
+        if self.live_enabled:
+            self.progress = Progress(
+                TextColumn("overall"),
+                TextColumn("source scan"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True,
+            )
+            self.task_id = self.progress.add_task("source scan", total=max(self.total_bytes, 1), completed=0)
+            self.progress.start()
+        return self
+
+    def advance(self, amount: int) -> None:
+        if self.progress is not None and self.task_id is not None:
+            self.progress.advance(self.task_id, amount)
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.progress is not None:
+            self.progress.stop()
         return False
 
 
@@ -881,7 +914,7 @@ def new_pack_state(config: dict[str, object], run_id: str, backend_name: str) ->
     return state, pack_dir
 
 
-def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: StorageBackend, state: dict[str, object]) -> None:
+def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: StorageBackend, state: dict[str, object], pack_label: str) -> None:
     entries = [
         Entry(
             source=Path(item["source"]),
@@ -896,7 +929,7 @@ def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: Storag
     manifest = make_manifest(entries, str(state["created_at"]))
     tar_path = Path(str(state["tar_path"]))
     enc_path = Path(str(state["enc_path"]))
-    progress = PackProgress(str(state["pack_id"]))
+    progress = PackProgress(pack_label)
     try:
         with progress.build(sum(entry.size for entry in entries)) as build_progress:
             write_tar(tar_path, manifest, entries, on_progress=build_progress.advance)
@@ -925,14 +958,13 @@ def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: Storag
 
 
 def backup_source(config: dict[str, object], source: Path, dry_run: bool = False) -> dict[str, int]:
-    if dry_run:
-        db = connect_db(config)
-        try:
-            return plan_backup(db, config, source)
-        finally:
-            db.close()
-
     db = connect_db(config)
+    planned = plan_backup(db, config, source)
+    if dry_run:
+        db.close()
+        return planned
+    prescan = pre_scan_source(config, source)
+
     backend = get_default_backend(config)
     resume_pending(config, db, backend)
     fail_stale_runs(db)
@@ -949,51 +981,53 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
     state, _ = new_pack_state(config, run_id, backend_name)
     current_size = 0
     run_hashes: set[str] = set()
+    next_pack_number = 1
     try:
-        for path in iter_files(source):
-            entry = build_entry(source, path)
-            previous = current_path_row(db, entry.rel_path)
-            stats["files_scanned"] += 1
-            stats["bytes_total_scanned"] += entry.size
-            upsert_file_path(db, entry)
-            if entry.sha256 in run_hashes or has_hash(db, entry.sha256):
-                stats["files_deduped"] += 1
-                if should_record_path_version(previous, entry):
-                    blob = lookup_file_blob(db, entry.sha256)
-                    record_path_version(
-                        db,
-                        path=entry.rel_path,
-                        sha256=entry.sha256,
-                        mtime=entry.mtime,
-                        run_id=run_id,
-                        recorded_at=started,
-                        pack_id=None if blob is None else blob["pack_id"],
-                    )
-                continue
-            stats["files_new"] += 1
-            stats["bytes_new"] += entry.size
-            run_hashes.add(entry.sha256)
-            state["entries"].append(
-                {
-                    "source": str(entry.source),
-                    "original_path": entry.rel_path,
-                    "member_path": entry.member_path,
-                    "size": entry.size,
-                    "sha256": entry.sha256,
-                    "mtime": entry.mtime,
-                }
-            )
-            current_size += entry.size
-            if current_size >= target:
-                stats["packs_created"] += 1
-                if not dry_run:
-                    seal_pack(config, db, backend, state)
-                state, _ = new_pack_state(config, run_id, backend_name)
-                current_size = 0
+        with ScanProgress(prescan["bytes_total_scanned"]) as scan_progress:
+            for path in iter_files(source):
+                entry = build_entry(source, path)
+                scan_progress.advance(entry.size)
+                previous = current_path_row(db, entry.rel_path)
+                stats["files_scanned"] += 1
+                stats["bytes_total_scanned"] += entry.size
+                upsert_file_path(db, entry)
+                if entry.sha256 in run_hashes or has_hash(db, entry.sha256):
+                    stats["files_deduped"] += 1
+                    if should_record_path_version(previous, entry):
+                        blob = lookup_file_blob(db, entry.sha256)
+                        record_path_version(
+                            db,
+                            path=entry.rel_path,
+                            sha256=entry.sha256,
+                            mtime=entry.mtime,
+                            run_id=run_id,
+                            recorded_at=started,
+                            pack_id=None if blob is None else blob["pack_id"],
+                        )
+                    continue
+                stats["files_new"] += 1
+                stats["bytes_new"] += entry.size
+                run_hashes.add(entry.sha256)
+                state["entries"].append(
+                    {
+                        "source": str(entry.source),
+                        "original_path": entry.rel_path,
+                        "member_path": entry.member_path,
+                        "size": entry.size,
+                        "sha256": entry.sha256,
+                        "mtime": entry.mtime,
+                    }
+                )
+                current_size += entry.size
+                if current_size >= target:
+                    stats["packs_created"] += 1
+                    seal_pack(config, db, backend, state, f"{next_pack_number}/{prescan['packs_estimated']}")
+                    next_pack_number += 1
+                    state, _ = new_pack_state(config, run_id, backend_name)
+                    current_size = 0
         if state["entries"]:
             stats["packs_created"] += 1
-            if not dry_run:
-                seal_pack(config, db, backend, state)
+            seal_pack(config, db, backend, state, f"{next_pack_number}/{prescan['packs_estimated']}")
         if not dry_run:
             snapshot_catalog(config, backend)
         update_backup_run(db, run_id, stats, status="DRY_RUN" if dry_run else "COMPLETED")
@@ -1027,6 +1061,18 @@ def plan_backup(db: sqlite3.Connection, config: dict[str, object], source: Path)
     if current_size > 0:
         stats["packs_created"] += 1
     return stats
+
+
+def pre_scan_source(config: dict[str, object], source: Path) -> dict[str, int]:
+    total_files = 0
+    total_bytes = 0
+    for path in iter_files(source):
+        stat = path.stat()
+        total_files += 1
+        total_bytes += stat.st_size
+    target = int(config["pack_size_mb"]) * 1024 * 1024
+    packs_estimated = max(1, math.ceil(total_bytes / target)) if total_bytes else 0
+    return {"files_scanned": total_files, "bytes_total_scanned": total_bytes, "packs_estimated": packs_estimated}
 
 
 def fetch_pack(config: dict[str, object], backend: StorageBackend, object_key: str, workdir: Path, progress: PackProgress | None = None) -> Path:
@@ -1577,7 +1623,7 @@ def backup(ctx: click.Context, dry_run: bool, source: Path) -> None:
         ("Files scanned", str(stats["files_scanned"])),
         ("Files to back up", str(stats["files_new"])),
         ("Files deduped", str(stats["files_deduped"])),
-        ("Estimated packs", str(stats["packs_created"])),
+        ("Estimated packs" if dry_run else "Packs used", str(stats["packs_created"])),
         ("New data", format_bytes(stats["bytes_new"])),
         ("New data bytes", str(stats["bytes_new"])),
         ("Scanned data", format_bytes(stats["bytes_total_scanned"])),
