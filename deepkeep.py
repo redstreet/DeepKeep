@@ -457,6 +457,20 @@ def format_bytes(value: int) -> str:
     return f"{value} B"
 
 
+def format_local_timestamp(moment: datetime | None = None) -> str:
+    value = datetime.now().astimezone() if moment is None else moment.astimezone()
+    return value.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def format_duration(seconds: float) -> str:
+    total = int(seconds)
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 def require_tool(name: str) -> None:
     if shutil.which(name):
         return
@@ -1894,6 +1908,8 @@ def cli(ctx: click.Context, config_path: Path) -> None:
 def backup(ctx: click.Context, dry_run: bool, source: Path) -> None:
     """Back up SOURCE in sorted directory order."""
     config = current_config(ctx)
+    started_at = datetime.now().astimezone()
+    console.print(f"Started: {format_local_timestamp(started_at)}")
     stats = backup_source(config, source.resolve(), dry_run=dry_run)
     table = Table(title="Backup Summary")
     table.add_column("Metric")
@@ -1912,6 +1928,9 @@ def backup(ctx: click.Context, dry_run: bool, source: Path) -> None:
     for key, value in rows:
         table.add_row(key, value)
     console.print(table)
+    completed_at = datetime.now().astimezone()
+    mode_label = "dry run" if dry_run else "backup"
+    console.print(f"Completed: {format_local_timestamp(completed_at)}  total time taken for {mode_label}: {format_duration((completed_at - started_at).total_seconds())}")
 
 
 @cli.command("restore")
@@ -1937,6 +1956,8 @@ def restore_cmd(
     if not restore_all and not prefixes:
         raise click.UsageError("provide at least one path prefix, or use --all")
     config = current_config(ctx)
+    started_at = datetime.now().astimezone()
+    console.print(f"Started: {format_local_timestamp(started_at)}")
     restored, pending = restore_prefixes(
         config,
         prefixes,
@@ -1949,6 +1970,8 @@ def restore_cmd(
     console.print(f"restored: {restored}")
     if pending:
         console.print(f"packs pending glacier restore: {pending}")
+    completed_at = datetime.now().astimezone()
+    console.print(f"Completed: {format_local_timestamp(completed_at)}  total time taken for restore: {format_duration((completed_at - started_at).total_seconds())}")
 
 
 @cli.command("verify-pack")
