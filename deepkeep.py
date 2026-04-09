@@ -234,6 +234,14 @@ class ScanProgress:
         if self.progress is not None and self.task_id is not None:
             self.progress.advance(self.task_id, amount)
 
+    def suspend(self) -> None:
+        if self.progress is not None:
+            self.progress.stop()
+
+    def resume(self) -> None:
+        if self.progress is not None:
+            self.progress.start()
+
     def __exit__(self, exc_type, exc, tb):
         if self.progress is not None:
             self.progress.stop()
@@ -1021,13 +1029,17 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
                 current_size += entry.size
                 if current_size >= target:
                     stats["packs_created"] += 1
+                    scan_progress.suspend()
                     seal_pack(config, db, backend, state, f"{next_pack_number}/{prescan['packs_estimated']}")
+                    scan_progress.resume()
                     next_pack_number += 1
                     state, _ = new_pack_state(config, run_id, backend_name)
                     current_size = 0
         if state["entries"]:
             stats["packs_created"] += 1
+            scan_progress.suspend()
             seal_pack(config, db, backend, state, f"{next_pack_number}/{prescan['packs_estimated']}")
+            scan_progress.resume()
         if not dry_run:
             snapshot_catalog(config, backend)
         update_backup_run(db, run_id, stats, status="DRY_RUN" if dry_run else "COMPLETED")
