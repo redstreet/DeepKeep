@@ -476,6 +476,12 @@ def format_local_timestamp(moment: datetime | None = None) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def format_catalog_timestamp(value: str | None) -> str:
+    if not value:
+        return ""
+    return format_local_timestamp(parse_utc(value))
+
+
 def format_duration(seconds: float) -> str:
     total = int(seconds)
     minutes, secs = divmod(total, 60)
@@ -1841,7 +1847,7 @@ def render_runs(rows: list[sqlite3.Row], plaintext: bool) -> None:
     for row in rows:
         table.add_row(
             row["run_id"],
-            row["started_at"],
+            format_catalog_timestamp(row["started_at"]),
             row["status"],
             row["machine"] or "",
             format_int(row["files_new"]),
@@ -1867,7 +1873,13 @@ def render_files(rows: list[sqlite3.Row], plaintext: bool, title: str = "Catalog
     table.add_column("Pack")
     table.add_column("Run")
     for row in rows:
-        table.add_row(row["path"], format_int(row["size"]), row["mtime"] or "", row["pack_id"], row["run_id"] or "")
+        table.add_row(
+            row["path"],
+            format_int(row["size"]),
+            format_catalog_timestamp(row["mtime"]),
+            row["pack_id"],
+            row["run_id"] or "",
+        )
     console.print(table)
 
 
@@ -1891,7 +1903,7 @@ def render_packs(rows: list[sqlite3.Row], plaintext: bool, title: str = "Packs")
     for row in rows:
         table.add_row(
             row["pack_id"],
-            row["created_at"],
+            format_catalog_timestamp(row["created_at"]),
             row["run_id"],
             format_int(row["file_count"]),
             format_int(row["total_bytes"]),
@@ -1915,7 +1927,7 @@ def render_file_detail(row: sqlite3.Row | None, plaintext: bool) -> None:
     for key, value in (
         ("Path", row["path"]),
         ("Size", format_int(row["size"])),
-        ("Modified", row["mtime"] or ""),
+        ("Modified", format_catalog_timestamp(row["mtime"])),
         ("SHA256", row["sha256"]),
         ("Pack", row["pack_id"]),
         ("Tar Path", row["tar_path"]),
@@ -1947,10 +1959,10 @@ def render_file_history(rows: list[sqlite3.Row], plaintext: bool) -> None:
         table.add_row(
             row["path"],
             row["run_id"],
-            row["recorded_at"],
+            format_catalog_timestamp(row["recorded_at"]),
             row["pack_id"],
             format_int(row["size"]),
-            row["mtime"] or "",
+            format_catalog_timestamp(row["mtime"]),
         )
     console.print(table)
 
@@ -2164,8 +2176,8 @@ def catalog_run_cmd(ctx: click.Context, run_id: str, plaintext: bool) -> None:
         table.add_column("Value", overflow="fold")
         for key, value in (
             ("Run ID", run_row["run_id"]),
-            ("Started", run_row["started_at"]),
-            ("Completed", run_row["completed_at"] or ""),
+            ("Started", format_catalog_timestamp(run_row["started_at"])),
+            ("Completed", format_catalog_timestamp(run_row["completed_at"])),
             ("Status", run_row["status"]),
             ("Machine", run_row["machine"] or ""),
             ("Source", run_row["source_path"]),
