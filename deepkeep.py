@@ -2057,6 +2057,23 @@ def verify_catalog_cmd(ctx: click.Context) -> None:
     console.print("catalog verified")
 
 
+@cli.command("upload-catalog")
+@click.pass_context
+def upload_catalog_cmd(ctx: click.Context) -> None:
+    """Upload the current local catalog snapshot to the configured backend."""
+    config = current_config(ctx)
+    started_at = datetime.now().astimezone()
+    console.print(f"Started: {format_local_timestamp(started_at)}")
+    db = connect_db(config)
+    try:
+        quick_validate_catalog(db)
+    finally:
+        db.close()
+    snapshot_catalog(config, get_backend(config))
+    completed_at = datetime.now().astimezone()
+    console.print(f"Completed: {format_local_timestamp(completed_at)}  total time taken for catalog upload: {format_duration((completed_at - started_at).total_seconds())}")
+
+
 @cli.command("rebuild-catalog")
 @click.pass_context
 def rebuild_catalog_cmd(ctx: click.Context) -> None:

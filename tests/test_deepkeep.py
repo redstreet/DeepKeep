@@ -163,6 +163,30 @@ def test_snapshot_catalog_writes_latest_every_run_but_weekly_snapshots(tmp_path:
     assert len(snapshots) == 1
 
 
+def test_upload_catalog_command_runs_quick_check_and_uploads(fake_crypto, repo: tuple[Path, Path, Path], monkeypatch) -> None:
+    source, storage, config = repo
+    (source / "one.txt").write_text("one")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code == 0, result.output
+
+    seen = {"quick_check": 0}
+    original = deepkeep.quick_validate_catalog
+
+    def wrapped_quick_check(db) -> None:
+        seen["quick_check"] += 1
+        original(db)
+
+    monkeypatch.setattr(deepkeep, "quick_validate_catalog", wrapped_quick_check)
+    result = runner.invoke(deepkeep.cli, cli_args(config, "upload-catalog"))
+    assert result.exit_code == 0, result.output
+    assert seen["quick_check"] == 1
+    assert "Started:" in result.output
+    assert "Completed:" in result.output
+    assert "catalog upload" in result.output
+    assert (storage / "catalog" / "latest.sqlite.age").exists()
+
+
 def test_s3_list_objects_returns_empty_for_missing_prefix(monkeypatch) -> None:
     monkeypatch.setattr(deepkeep, "require_tool", lambda name: None)
     backend = deepkeep.S3Backend(
