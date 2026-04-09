@@ -278,8 +278,9 @@ class _BarProgress:
 
 
 class ScanProgress:
-    def __init__(self, total_bytes: int) -> None:
+    def __init__(self, total_bytes: int, phase: str = "source scan") -> None:
         self.total_bytes = total_bytes
+        self.phase = phase
         self.live_enabled = console.is_terminal
         self.progress = None
         self.task_id = None
@@ -288,14 +289,14 @@ class ScanProgress:
         if self.live_enabled:
             self.progress = Progress(
                 TextColumn("overall"),
-                TextColumn("source scan"),
+                TextColumn(self.phase),
                 BarColumn(),
                 TaskProgressColumn(),
                 TimeElapsedColumn(),
                 console=console,
                 transient=True,
             )
-            self.task_id = self.progress.add_task("source scan", total=max(self.total_bytes, 1), completed=0)
+            self.task_id = self.progress.add_task(self.phase, total=max(self.total_bytes, 1), completed=0)
             self.progress.start()
         return self
 
@@ -975,6 +976,20 @@ def stage_root(config: dict[str, object]) -> Path:
     return root
 
 
+def pending_stages(config: dict[str, object]) -> list[StagedPack]:
+    return [read_stage(path) for path in sorted(stage_root(config).glob("packs/*/state.json"))]
+
+
+def resumable_stage_hashes(config: dict[str, object]) -> set[str]:
+    hashes: set[str] = set()
+    for stage in pending_stages(config):
+        if stage.status not in {"ENCRYPTED", "UPLOADED"}:
+            continue
+        for item in stage.entries:
+            hashes.add(str(item["sha256"]))
+    return hashes
+
+
 def update_backup_run(
     db: sqlite3.Connection,
     run_id: str,
@@ -1160,6 +1175,18 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
     backend = get_backend(config)
     bind_or_validate_backend_identity(db, config)
     store_backend_label(db, config)
+    unfinished = pending_stages(config)
+    pack_total = prescan["packs_estimated"]
+    if unfinished:
+        console.print("Found unfinished backup state. Running a dedupe scan for an exact remaining pack estimate.")
+        planned = plan_backup(
+            db,
+            config,
+            source,
+            existing_hashes=resumable_stage_hashes(config),
+            progress_total=prescan["bytes_total_scanned"],
+        )
+        pack_total = planned["packs_created"]
     resume_pending(config, db, backend)
     fail_stale_runs(db)
     run_id, started = start_backup_run(db, source)
@@ -1191,14 +1218,14 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
                         stats,
                         scan_progress,
                         next_pack_number,
-                        prescan["packs_estimated"],
+                        pack_total,
                     )
                     current_size = 0
             if state.entries:
                 scan_progress.suspend()
                 try:
                     stats["packs_created"] += 1
-                    seal_pack(config, db, backend, state, f"{next_pack_number}/{prescan['packs_estimated']}")
+                    seal_pack(config, db, backend, state, f"{next_pack_number}/{pack_total}")
                 finally:
                     scan_progress.resume()
         quick_validate_catalog(db)
@@ -1212,25 +1239,51 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
         db.close()
 
 
-def plan_backup(db: sqlite3.Connection, config: dict[str, object], source: Path) -> dict[str, int]:
+def plan_backup(
+    db: sqlite3.Connection,
+    config: dict[str, object],
+    source: Path,
+    *,
+    existing_hashes: set[str] | None = None,
+    progress_total: int | None = None,
+    progress_phase: str = "dedupe scan",
+) -> dict[str, int]:
     stats = {"files_scanned": 0, "files_new": 0, "files_deduped": 0, "bytes_new": 0, "bytes_total_scanned": 0, "packs_created": 0}
     target = int(config["pack_size_mb"]) * 1024 * 1024
     current_size = 0
-    run_hashes: set[str] = set()
-    for path in iter_files(source):
-        entry = build_entry(source, path)
-        stats["files_scanned"] += 1
-        stats["bytes_total_scanned"] += entry.size
-        if entry.sha256 in run_hashes or has_hash(db, entry.sha256):
-            stats["files_deduped"] += 1
-            continue
-        stats["files_new"] += 1
-        stats["bytes_new"] += entry.size
-        run_hashes.add(entry.sha256)
-        current_size += entry.size
-        if current_size >= target:
-            stats["packs_created"] += 1
-            current_size = 0
+    run_hashes: set[str] = set(existing_hashes or set())
+    if progress_total is None:
+        for path in iter_files(source):
+            entry = build_entry(source, path)
+            stats["files_scanned"] += 1
+            stats["bytes_total_scanned"] += entry.size
+            if entry.sha256 in run_hashes or has_hash(db, entry.sha256):
+                stats["files_deduped"] += 1
+                continue
+            stats["files_new"] += 1
+            stats["bytes_new"] += entry.size
+            run_hashes.add(entry.sha256)
+            current_size += entry.size
+            if current_size >= target:
+                stats["packs_created"] += 1
+                current_size = 0
+    else:
+        with ScanProgress(progress_total, phase=progress_phase) as scan_progress:
+            for path in iter_files(source):
+                entry = build_entry(source, path)
+                scan_progress.advance(entry.size)
+                stats["files_scanned"] += 1
+                stats["bytes_total_scanned"] += entry.size
+                if entry.sha256 in run_hashes or has_hash(db, entry.sha256):
+                    stats["files_deduped"] += 1
+                    continue
+                stats["files_new"] += 1
+                stats["bytes_new"] += entry.size
+                run_hashes.add(entry.sha256)
+                current_size += entry.size
+                if current_size >= target:
+                    stats["packs_created"] += 1
+                    current_size = 0
     if current_size > 0:
         stats["packs_created"] += 1
     return stats

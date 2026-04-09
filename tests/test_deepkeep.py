@@ -628,6 +628,31 @@ def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path], monke
     db.close()
 
 
+def test_backup_rerun_after_failed_upload_reports_resume_scan(fake_crypto, repo: tuple[Path, Path, Path], monkeypatch) -> None:
+    source, _, config = repo
+    (source / "resume.txt").write_text("resume")
+    runner = CliRunner()
+    calls = {"put": 0}
+
+    def flaky_put(self, key: str, path: str) -> None:
+        calls["put"] += 1
+        if calls["put"] == 1:
+            raise RuntimeError("boom")
+        dest = self.root / key
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest)
+
+    monkeypatch.setattr(deepkeep.LocalBackend, "put_object", flaky_put)
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code != 0
+
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code == 0, result.output
+    assert "Found unfinished backup state" in result.output
+    assert "upload" in result.output
+    assert "commit" in result.output
+
+
 def test_catalog_default_lists_summary_and_runs(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
     source, _, config = repo
     (source / "a.txt").write_text("alpha")
