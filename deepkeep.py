@@ -603,6 +603,10 @@ def connect_db(config: dict[str, object]) -> sqlite3.Connection:
             recorded_at TEXT NOT NULL,
             PRIMARY KEY (run_id, path)
         );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_run_files_run_id ON run_files(run_id);
         CREATE INDEX IF NOT EXISTS idx_run_files_pack_id ON run_files(pack_id);
         CREATE INDEX IF NOT EXISTS idx_path_versions_path_recorded ON path_versions(path, recorded_at);
@@ -677,6 +681,50 @@ def verify_catalog(config: dict[str, object]) -> list[str]:
         return sqlite_check_issues(db, "integrity_check") + catalog_reference_issues(db)
     finally:
         db.close()
+
+
+def backend_identity(config: dict[str, object]) -> str:
+    return json.dumps(config["backend"], sort_keys=True, separators=(",", ":"))
+
+
+def configured_backend_label(config: dict[str, object]) -> str:
+    cfg = config["backend"]
+    if cfg["type"] == "local":
+        return f"local:{cfg['root']}"
+    return f"s3:{cfg['bucket']}/{cfg['prefix']}"
+
+
+def stored_backend_identity(db: sqlite3.Connection) -> str | None:
+    row = db.execute("SELECT value FROM settings WHERE key = ?", ("catalog_backend_identity",)).fetchone()
+    return None if row is None else str(row["value"])
+
+
+def bind_or_validate_backend_identity(db: sqlite3.Connection, config: dict[str, object]) -> None:
+    current = backend_identity(config)
+    stored = stored_backend_identity(db)
+    if stored is None:
+        db.execute(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+            ("catalog_backend_identity", current),
+        )
+        db.commit()
+        return
+    if stored != current:
+        row = db.execute("SELECT value FROM settings WHERE key = ?", ("catalog_backend_label",)).fetchone()
+        stored_label = row["value"] if row is not None else "configured backend"
+        raise DeepKeepError(
+            f"catalog is bound to a different backend\n"
+            f"catalog backend: {stored_label}\n"
+            f"configured backend: {configured_backend_label(config)}"
+        )
+
+
+def store_backend_label(db: sqlite3.Connection, config: dict[str, object]) -> None:
+    db.execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+        ("catalog_backend_label", configured_backend_label(config)),
+    )
+    db.commit()
 
 
 def upsert_file_path(db: sqlite3.Connection, entry: Entry) -> None:
@@ -1092,6 +1140,8 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
     prescan = pre_scan_source(config, source)
 
     backend = get_backend(config)
+    bind_or_validate_backend_identity(db, config)
+    store_backend_label(db, config)
     resume_pending(config, db, backend)
     fail_stale_runs(db)
     run_id, started = start_backup_run(db, source)

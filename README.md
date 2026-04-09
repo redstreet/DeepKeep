@@ -70,6 +70,8 @@ backend:
   storage_class: DEEP_ARCHIVE
 ```
 
+The first real backup binds the catalog to that exact backend config. If you later change the backend block for the same catalog, `backup` will fail instead of writing to a different target.
+
 ## Local Backend Example
 
 ```yaml

@@ -258,6 +258,53 @@ def test_backup_dry_run_matches_real_backup_stats(fake_crypto, repo: tuple[Path,
     assert row[1] == 1
 
 
+def test_dry_run_does_not_bind_backend_identity(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, _, config = repo
+    (source / "a.txt").write_text("one")
+    runner = CliRunner()
+
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", "--dry-run", str(source)))
+    assert result.exit_code == 0, result.output
+
+    loaded = deepkeep.load_config(config)
+    db = deepkeep.connect_db(loaded)
+    row = db.execute("SELECT value FROM settings WHERE key = 'catalog_backend_identity'").fetchone()
+    db.close()
+    assert row is None
+
+
+def test_backup_rejects_changed_backend_config(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, storage, config = repo
+    (source / "one.txt").write_text("one")
+    runner = CliRunner()
+
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code == 0, result.output
+
+    other_storage = config.parent / "other-storage"
+    other_storage.mkdir()
+    config.write_text(
+        "\n".join(
+            [
+                f"catalog_path: {config.parent / 'catalog.sqlite'}",
+                "pack_size_mb: 1",
+                "age_pass_entry: backups/deepkeep",
+                f"work_root: {config.parent / '.work'}",
+                "backend:",
+                "  type: local",
+                f"  root: {other_storage}",
+            ]
+        )
+    )
+
+    (source / "two.txt").write_text("two")
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code != 0
+    assert "catalog is bound to a different backend" in result.output
+    assert str(storage) in result.output
+    assert str(other_storage) in result.output
+
+
 def test_run_formats_called_process_error(monkeypatch) -> None:
     def boom(*args, **kwargs):
         raise deepkeep.subprocess.CalledProcessError(
