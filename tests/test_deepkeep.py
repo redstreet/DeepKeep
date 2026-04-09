@@ -61,11 +61,11 @@ def test_load_config_requires_age_pass_entry(tmp_path: Path) -> None:
     config.write_text(
         "\n".join(
             [
-                "backend: local",
                 f"catalog_path: {tmp_path / 'catalog.sqlite'}",
                 "pack_size_mb: 1",
                 f"work_root: {tmp_path / '.work'}",
-                "local:",
+                "backend:",
+                "  type: local",
                 f"  root: {tmp_path / 'storage'}",
             ]
         )
@@ -79,13 +79,11 @@ def test_load_config_requires_single_backend_mapping(tmp_path: Path) -> None:
     config.write_text(
         "\n".join(
             [
-                "backend: local",
                 f"catalog_path: {tmp_path / 'catalog.sqlite'}",
                 "pack_size_mb: 1",
                 "age_pass_entry: backups/deepkeep",
                 f"work_root: {tmp_path / '.work'}",
-                "local:",
-                f"  root: {tmp_path / 'storage'}",
+                "backend: local",
             ]
         )
     )
@@ -578,7 +576,7 @@ def test_resume_pending_upload(fake_crypto, repo: tuple[Path, Path, Path], monke
     db = deepkeep.connect_db(config)
     backend = deepkeep.get_backend(config)
     run_id = "run123"
-    state, pack_dir = deepkeep.new_pack_state(config, run_id, backend.backend_name)
+    state, pack_dir = deepkeep.new_pack_state(config, run_id)
     entry = deepkeep.build_entry(source, source / "resume.txt")
     state.entries = [
         {
@@ -633,6 +631,7 @@ def test_catalog_default_lists_summary_and_runs(fake_crypto, repo: tuple[Path, P
     result = runner.invoke(deepkeep.cli, cli_args(config, "catalog"))
     assert result.exit_code == 0, result.output
     assert "Catalog Summary" in result.output
+    assert "Backend" in result.output
     assert "Backup Runs" in result.output
     assert "COMPLETED" in result.output
     assert socket.gethostname() in result.output
@@ -651,6 +650,7 @@ def test_catalog_plaintext_is_pipe_friendly(fake_crypto, repo: tuple[Path, Path,
     assert "Catalog Summary" not in result.output
     assert "Backup Runs" not in result.output
     assert "SUMMARY\t" in result.output
+    assert f"SUMMARY\tlocal:{config.parent / 'storage'}\t" in result.output
     assert "RUN\t" in result.output
     assert socket.gethostname() in result.output
     assert str(source) in result.output
@@ -708,12 +708,10 @@ def test_catalog_packs_and_file_detail(fake_crypto, repo: tuple[Path, Path, Path
     result = runner.invoke(deepkeep.cli, cli_args(config, "catalog", "packs", "--plaintext"))
     assert result.exit_code == 0, result.output
     assert "PACK\t" in result.output
-    assert "\tlocal\t" in result.output
 
     result = runner.invoke(deepkeep.cli, cli_args(config, "catalog", "file", "detail.txt", "--plaintext"))
     assert result.exit_code == 0, result.output
     assert "FILE_DETAIL\tdetail.txt\t" in result.output
-    assert "\tlocal\t" in result.output
 
 
 def test_restore_can_restore_older_version_as_of_run(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path) -> None:

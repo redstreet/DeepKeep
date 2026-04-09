@@ -49,8 +49,6 @@ class DeepKeepCLI(click.Group):
 
 
 class StorageBackend(Protocol):
-    backend_name: str
-
     def put_object(self, key: str, path: str) -> None: ...
     def get_object(self, key: str, dest_path: str) -> None: ...
     def exists(self, key: str) -> bool: ...
@@ -82,7 +80,6 @@ class Entry:
 class StagedPack:
     pack_id: str
     run_id: str
-    backend_name: str
     created_at: str
     object_key: str
     status: str
@@ -94,7 +91,6 @@ class StagedPack:
         return {
             "pack_id": self.pack_id,
             "run_id": self.run_id,
-            "backend_name": self.backend_name,
             "created_at": self.created_at,
             "object_key": self.object_key,
             "status": self.status,
@@ -108,7 +104,6 @@ class StagedPack:
         return cls(
             pack_id=str(data["pack_id"]),
             run_id=str(data["run_id"]),
-            backend_name=str(data["backend_name"]),
             created_at=str(data["created_at"]),
             object_key=str(data["object_key"]),
             status=str(data["status"]),
@@ -558,7 +553,6 @@ def connect_db(config: dict[str, object]) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS packs (
             pack_id TEXT PRIMARY KEY,
             object_key TEXT NOT NULL,
-            backend_name TEXT NOT NULL,
             created_at TEXT NOT NULL,
             compression TEXT NOT NULL,
             encryption TEXT NOT NULL,
@@ -612,10 +606,6 @@ def connect_db(config: dict[str, object]) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_path_versions_path_recorded ON path_versions(path, recorded_at);
         """
     )
-    pack_columns = {row["name"] for row in db.execute("PRAGMA table_info(packs)").fetchall()}
-    if "backend_name" not in pack_columns:
-        db.execute("ALTER TABLE packs ADD COLUMN backend_name TEXT NOT NULL DEFAULT ''")
-    db.execute("UPDATE packs SET backend_name = ? WHERE backend_name = '' OR backend_name IS NULL", (get_backend(config).backend_name,))
     db.commit()
     return db
 
@@ -679,6 +669,15 @@ def verify_catalog(config: dict[str, object]) -> list[str]:
     db = connect_db(config)
     try:
         return sqlite_check_issues(db, "integrity_check") + catalog_reference_issues(db)
+    finally:
+        db.close()
+
+
+def catalog_backend_label(config: dict[str, object]) -> str:
+    db = connect_db(config)
+    try:
+        row = db.execute("SELECT value FROM settings WHERE key = ?", ("catalog_backend_label",)).fetchone()
+        return current_backend_label(config) if row is None else str(row["value"])
     finally:
         db.close()
 
@@ -952,6 +951,10 @@ def get_backend(config: dict[str, object]) -> StorageBackend:
     return S3Backend("s3", cfg)
 
 
+def current_backend_label(config: dict[str, object]) -> str:
+    return configured_backend_label(config)
+
+
 def stage_root(config: dict[str, object]) -> Path:
     root = Path(str(config["work_root"]))
     root.mkdir(parents=True, exist_ok=True)
@@ -1023,11 +1026,10 @@ def snapshot_catalog(config: dict[str, object], backend: StorageBackend) -> None
 
 def commit_pack(db: sqlite3.Connection, stage: StagedPack) -> None:
     db.execute(
-        "INSERT OR REPLACE INTO packs(pack_id, object_key, backend_name, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO packs(pack_id, object_key, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             stage.pack_id,
             stage.object_key,
-            stage.backend_name,
             stage.created_at,
             "off",
             "age",
@@ -1078,7 +1080,7 @@ def resume_pending(config: dict[str, object], db: sqlite3.Connection, backend: S
     return committed
 
 
-def new_pack_state(config: dict[str, object], run_id: str, backend_name: str) -> tuple[StagedPack, Path]:
+def new_pack_state(config: dict[str, object], run_id: str) -> tuple[StagedPack, Path]:
     pack_id = uuid.uuid4().hex[:12]
     created_at = utc_now()
     object_key = pack_object_key(pack_id, created_at)
@@ -1087,7 +1089,6 @@ def new_pack_state(config: dict[str, object], run_id: str, backend_name: str) ->
     state = StagedPack(
         pack_id=pack_id,
         run_id=run_id,
-        backend_name=backend_name,
         created_at=created_at,
         object_key=object_key,
         status="BUILDING",
@@ -1147,8 +1148,7 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
     run_id, started = start_backup_run(db, source)
     stats = empty_backup_stats()
     target = int(config["pack_size_mb"]) * 1024 * 1024
-    backend_name = backend.backend_name
-    state, _ = new_pack_state(config, run_id, backend_name)
+    state, _ = new_pack_state(config, run_id)
     current_size = 0
     run_hashes: set[str] = set()
     next_pack_number = 1
@@ -1292,7 +1292,7 @@ def finalize_stage_pack(
         seal_pack(config, db, backend, state, f"{pack_number}/{pack_total}")
     finally:
         scan_progress.resume()
-    return new_pack_state(config, state.run_id, backend.backend_name)[0], pack_number + 1
+    return new_pack_state(config, state.run_id)[0], pack_number + 1
 
 
 def fetch_pack(config: dict[str, object], backend: StorageBackend, object_key: str, workdir: Path, progress: PackProgress | None = None) -> Path:
@@ -1326,7 +1326,7 @@ def select_restore_rows(
     if as_of_run is None:
         rows = db.execute(
             """
-            SELECT fp.path, fp.mtime, fp.sha256, f.size, f.pack_id, f.tar_path, p.object_key, p.backend_name
+            SELECT fp.path, fp.mtime, fp.sha256, f.size, f.pack_id, f.tar_path, p.object_key
             FROM file_paths fp
             JOIN files f ON f.sha256 = fp.sha256
             JOIN packs p ON p.pack_id = f.pack_id
@@ -1339,7 +1339,7 @@ def select_restore_rows(
             raise DeepKeepError(f"unknown run_id: {as_of_run}")
         rows = db.execute(
             """
-            SELECT pv.path, pv.mtime, pv.sha256, f.size, f.pack_id, f.tar_path, p.object_key, p.backend_name
+            SELECT pv.path, pv.mtime, pv.sha256, f.size, f.pack_id, f.tar_path, p.object_key
             FROM path_versions pv
             JOIN backup_runs br ON br.run_id = pv.run_id
             JOIN files f ON f.sha256 = pv.sha256
@@ -1490,7 +1490,7 @@ def restore_prefixes(
 
 def verify_pack(config: dict[str, object], pack_id: str) -> list[str]:
     db = connect_db(config)
-    row = db.execute("SELECT object_key, backend_name FROM packs WHERE pack_id = ?", (pack_id,)).fetchone()
+    row = db.execute("SELECT object_key FROM packs WHERE pack_id = ?", (pack_id,)).fetchone()
     if row is None:
         raise DeepKeepError(f"unknown pack_id: {pack_id}")
     backend = get_backend(config)
@@ -1528,8 +1528,8 @@ def rebuild_catalog(config: dict[str, object]) -> int:
             pack_id = name.split("pack-")[-1].split(".tar.age")[0]
             created_at = str(manifest.get("created_at", utc_now()))
             db.execute(
-                "INSERT OR REPLACE INTO packs(pack_id, object_key, backend_name, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (pack_id, key, backend.backend_name, created_at, "off", "age", 1, "rebuild"),
+                "INSERT OR REPLACE INTO packs(pack_id, object_key, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (pack_id, key, created_at, "off", "age", 1, "rebuild"),
             )
             for item in manifest["files"]:
                 db.execute(
@@ -1552,13 +1552,15 @@ def catalog_summary(config: dict[str, object]) -> sqlite3.Row:
     row = db.execute(
         """
         SELECT
+            ? AS backend,
             (SELECT COUNT(*) FROM backup_runs) AS run_count,
             (SELECT COUNT(*) FROM file_paths) AS path_count,
             (SELECT COUNT(*) FROM files) AS unique_file_count,
             (SELECT COUNT(*) FROM packs) AS pack_count,
             COALESCE((SELECT SUM(f.size) FROM file_paths fp JOIN files f ON f.sha256 = fp.sha256), 0) AS logical_bytes,
             COALESCE((SELECT SUM(size) FROM files), 0) AS unique_bytes
-        """
+        """,
+        (catalog_backend_label(config),),
     ).fetchone()
     db.close()
     return row
@@ -1591,11 +1593,11 @@ def catalog_run_detail(config: dict[str, object], run_id: str) -> tuple[sqlite3.
     ).fetchone()
     pack_rows = db.execute(
         """
-        SELECT p.pack_id, p.created_at, p.object_key, p.backend_name, p.run_id, COUNT(f.sha256) AS file_count, COALESCE(SUM(f.size), 0) AS total_bytes
+        SELECT p.pack_id, p.created_at, p.object_key, p.run_id, COUNT(f.sha256) AS file_count, COALESCE(SUM(f.size), 0) AS total_bytes
         FROM packs p
         LEFT JOIN files f ON f.pack_id = p.pack_id
         WHERE p.run_id = ?
-        GROUP BY p.pack_id, p.created_at, p.object_key, p.backend_name, p.run_id
+        GROUP BY p.pack_id, p.created_at, p.object_key, p.run_id
         ORDER BY p.created_at, p.pack_id
         """,
         (run_id,),
@@ -1646,10 +1648,10 @@ def catalog_packs(config: dict[str, object]) -> list[sqlite3.Row]:
     db = connect_db(config)
     rows = db.execute(
         """
-        SELECT p.pack_id, p.created_at, p.object_key, p.backend_name, p.run_id, COUNT(f.sha256) AS file_count, COALESCE(SUM(f.size), 0) AS total_bytes
+        SELECT p.pack_id, p.created_at, p.object_key, p.run_id, COUNT(f.sha256) AS file_count, COALESCE(SUM(f.size), 0) AS total_bytes
         FROM packs p
         LEFT JOIN files f ON f.pack_id = p.pack_id
-        GROUP BY p.pack_id, p.created_at, p.object_key, p.backend_name, p.run_id
+        GROUP BY p.pack_id, p.created_at, p.object_key, p.run_id
         ORDER BY p.created_at DESC, p.pack_id DESC
         """
     ).fetchall()
@@ -1661,7 +1663,7 @@ def catalog_file_detail(config: dict[str, object], path: str) -> sqlite3.Row | N
     db = connect_db(config)
     row = db.execute(
         """
-        SELECT fp.path, f.size, fp.mtime, fp.sha256, f.pack_id, f.tar_path, p.backend_name,
+        SELECT fp.path, f.size, fp.mtime, fp.sha256, f.pack_id, f.tar_path,
                (SELECT pv.run_id FROM path_versions pv WHERE pv.path = fp.path AND pv.sha256 = fp.sha256 ORDER BY pv.recorded_at DESC LIMIT 1) AS run_id,
                (SELECT COUNT(*) FROM path_versions pv WHERE pv.path = fp.path) AS version_count
         FROM file_paths fp
@@ -1679,10 +1681,9 @@ def catalog_file_history(config: dict[str, object], path: str) -> list[sqlite3.R
     db = connect_db(config)
     rows = db.execute(
         """
-        SELECT pv.path, f.size, pv.mtime, pv.sha256, f.pack_id, p.backend_name, pv.run_id, pv.recorded_at
+        SELECT pv.path, f.size, pv.mtime, pv.sha256, f.pack_id, pv.run_id, pv.recorded_at
         FROM path_versions pv
         JOIN files f ON f.sha256 = pv.sha256
-        JOIN packs p ON p.pack_id = f.pack_id
         WHERE pv.path = ?
         ORDER BY pv.recorded_at
         """,
@@ -1703,13 +1704,14 @@ def render_summary(summary: sqlite3.Row, plaintext: bool) -> None:
     if plaintext:
         click.echo(
             "SUMMARY\t"
-            f"{summary['run_count']}\t{summary['path_count']}\t{summary['unique_file_count']}\t"
+            f"{summary['backend']}\t{summary['run_count']}\t{summary['path_count']}\t{summary['unique_file_count']}\t"
             f"{summary['pack_count']}\t{summary['logical_bytes']}\t{summary['unique_bytes']}"
         )
         return
     table = Table(title="Catalog Summary")
     table.add_column("Metric")
     table.add_column("Value", justify="right")
+    table.add_row("Backend", str(summary["backend"]))
     table.add_row("Runs", str(summary["run_count"]))
     table.add_row("Archived paths", str(summary["path_count"]))
     table.add_row("Unique blobs", str(summary["unique_file_count"]))
@@ -1778,7 +1780,7 @@ def render_packs(rows: list[sqlite3.Row], plaintext: bool, title: str = "Packs")
     if plaintext:
         for row in rows:
             click.echo(
-                f"PACK\t{row['pack_id']}\t{row['created_at']}\t{row['object_key']}\t{row['backend_name']}\t{row['run_id']}\t{row['file_count']}\t{row['total_bytes']}"
+                f"PACK\t{row['pack_id']}\t{row['created_at']}\t{row['object_key']}\t{row['run_id']}\t{row['file_count']}\t{row['total_bytes']}"
             )
         return
     if not rows:
@@ -1787,7 +1789,6 @@ def render_packs(rows: list[sqlite3.Row], plaintext: bool, title: str = "Packs")
     table = Table(title=title)
     table.add_column("Pack ID")
     table.add_column("Created")
-    table.add_column("Backend")
     table.add_column("Run")
     table.add_column("Files", justify="right")
     table.add_column("Bytes", justify="right")
@@ -1796,7 +1797,6 @@ def render_packs(rows: list[sqlite3.Row], plaintext: bool, title: str = "Packs")
         table.add_row(
             row["pack_id"],
             row["created_at"],
-            row["backend_name"],
             row["run_id"],
             str(row["file_count"]),
             str(row["total_bytes"]),
@@ -1811,7 +1811,7 @@ def render_file_detail(row: sqlite3.Row | None, plaintext: bool) -> None:
         return
     if plaintext:
         click.echo(
-            f"FILE_DETAIL\t{row['path']}\t{row['size']}\t{row['mtime'] or ''}\t{row['sha256']}\t{row['pack_id']}\t{row['tar_path']}\t{row['backend_name']}\t{row['run_id'] or ''}\t{row['version_count']}"
+            f"FILE_DETAIL\t{row['path']}\t{row['size']}\t{row['mtime'] or ''}\t{row['sha256']}\t{row['pack_id']}\t{row['tar_path']}\t{row['run_id'] or ''}\t{row['version_count']}"
         )
         return
     table = Table(title="File Detail")
@@ -1824,7 +1824,6 @@ def render_file_detail(row: sqlite3.Row | None, plaintext: bool) -> None:
         ("SHA256", row["sha256"]),
         ("Pack", row["pack_id"]),
         ("Tar Path", row["tar_path"]),
-        ("Backend", row["backend_name"]),
         ("Run", row["run_id"] or ""),
         ("Versions", row["version_count"]),
     ):
@@ -1836,7 +1835,7 @@ def render_file_history(rows: list[sqlite3.Row], plaintext: bool) -> None:
     if plaintext:
         for row in rows:
             click.echo(
-                f"FILE_VERSION\t{row['path']}\t{row['run_id']}\t{row['recorded_at']}\t{row['sha256']}\t{row['pack_id']}\t{row['backend_name']}\t{row['size']}\t{row['mtime'] or ''}"
+                f"FILE_VERSION\t{row['path']}\t{row['run_id']}\t{row['recorded_at']}\t{row['sha256']}\t{row['pack_id']}\t{row['size']}\t{row['mtime'] or ''}"
             )
         return
     if not rows:
@@ -1847,7 +1846,6 @@ def render_file_history(rows: list[sqlite3.Row], plaintext: bool) -> None:
     table.add_column("Run")
     table.add_column("Recorded")
     table.add_column("Pack")
-    table.add_column("Backend")
     table.add_column("Size", justify="right")
     table.add_column("Modified")
     for row in rows:
@@ -1856,7 +1854,6 @@ def render_file_history(rows: list[sqlite3.Row], plaintext: bool) -> None:
             row["run_id"],
             row["recorded_at"],
             row["pack_id"],
-            row["backend_name"],
             str(row["size"]),
             row["mtime"] or "",
         )
