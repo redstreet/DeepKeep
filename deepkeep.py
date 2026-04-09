@@ -485,6 +485,10 @@ def format_duration(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def format_int(value: int) -> str:
+    return f"{value:,}"
+
+
 def require_tool(name: str) -> None:
     if shutil.which(name):
         return
@@ -1034,15 +1038,22 @@ def update_backup_run(
     db.commit()
 
 
+def run_has_committed_packs(db: sqlite3.Connection, run_id: str) -> bool:
+    row = db.execute("SELECT 1 FROM packs WHERE run_id = ? LIMIT 1", (run_id,)).fetchone()
+    return row is not None
+
+
 def fail_stale_runs(db: sqlite3.Connection) -> None:
-    db.execute(
-        """
-        UPDATE backup_runs
-        SET completed_at = COALESCE(completed_at, ?), status = ?, notes = COALESCE(notes, ?)
-        WHERE status = ?
-        """,
-        (utc_now(), "FAILED", "marked failed after a later backup detected an unfinished run", "RUNNING"),
-    )
+    for row in db.execute("SELECT run_id FROM backup_runs WHERE status = ?", ("RUNNING",)).fetchall():
+        status = "PARTIAL" if run_has_committed_packs(db, row["run_id"]) else "FAILED"
+        db.execute(
+            """
+            UPDATE backup_runs
+            SET completed_at = COALESCE(completed_at, ?), status = ?, notes = COALESCE(notes, ?)
+            WHERE run_id = ?
+            """,
+            (utc_now(), status, "marked incomplete after a later backup detected an unfinished run", row["run_id"]),
+        )
     db.commit()
 
 
@@ -1246,7 +1257,8 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
         update_backup_run(db, run_id, stats, status="COMPLETED")
         return stats
     except Exception as exc:
-        update_backup_run(db, run_id, stats, status="FAILED", notes=error_note(exc))
+        status = "PARTIAL" if run_has_committed_packs(db, run_id) else "FAILED"
+        update_backup_run(db, run_id, stats, status=status, notes=error_note(exc))
         raise
     finally:
         db.close()
@@ -1795,12 +1807,12 @@ def render_summary(summary: sqlite3.Row, plaintext: bool) -> None:
     table.add_column("Metric")
     table.add_column("Value", justify="right")
     table.add_row("Backend", str(summary["backend"]))
-    table.add_row("Runs", str(summary["run_count"]))
-    table.add_row("Archived paths", str(summary["path_count"]))
-    table.add_row("Unique blobs", str(summary["unique_file_count"]))
-    table.add_row("Packs", str(summary["pack_count"]))
-    table.add_row("Logical bytes", str(summary["logical_bytes"]))
-    table.add_row("Unique bytes", str(summary["unique_bytes"]))
+    table.add_row("Runs", format_int(summary["run_count"]))
+    table.add_row("Archived paths", format_int(summary["path_count"]))
+    table.add_row("Unique blobs", format_int(summary["unique_file_count"]))
+    table.add_row("Packs", format_int(summary["pack_count"]))
+    table.add_row("Logical bytes", format_int(summary["logical_bytes"]))
+    table.add_row("Unique bytes", format_int(summary["unique_bytes"]))
     console.print(table)
 
 
@@ -1832,9 +1844,9 @@ def render_runs(rows: list[sqlite3.Row], plaintext: bool) -> None:
             row["started_at"],
             row["status"],
             row["machine"] or "",
-            str(row["files_new"]),
-            str(row["files_deduped"]),
-            str(row["packs_created"]),
+            format_int(row["files_new"]),
+            format_int(row["files_deduped"]),
+            format_int(row["packs_created"]),
             row["source_path"],
         )
     console.print(table)
@@ -1855,7 +1867,7 @@ def render_files(rows: list[sqlite3.Row], plaintext: bool, title: str = "Catalog
     table.add_column("Pack")
     table.add_column("Run")
     for row in rows:
-        table.add_row(row["path"], str(row["size"]), row["mtime"] or "", row["pack_id"], row["run_id"] or "")
+        table.add_row(row["path"], format_int(row["size"]), row["mtime"] or "", row["pack_id"], row["run_id"] or "")
     console.print(table)
 
 
@@ -1881,8 +1893,8 @@ def render_packs(rows: list[sqlite3.Row], plaintext: bool, title: str = "Packs")
             row["pack_id"],
             row["created_at"],
             row["run_id"],
-            str(row["file_count"]),
-            str(row["total_bytes"]),
+            format_int(row["file_count"]),
+            format_int(row["total_bytes"]),
             row["object_key"],
         )
     console.print(table)
@@ -1902,13 +1914,13 @@ def render_file_detail(row: sqlite3.Row | None, plaintext: bool) -> None:
     table.add_column("Value", overflow="fold")
     for key, value in (
         ("Path", row["path"]),
-        ("Size", row["size"]),
+        ("Size", format_int(row["size"])),
         ("Modified", row["mtime"] or ""),
         ("SHA256", row["sha256"]),
         ("Pack", row["pack_id"]),
         ("Tar Path", row["tar_path"]),
         ("Run", row["run_id"] or ""),
-        ("Versions", row["version_count"]),
+        ("Versions", format_int(row["version_count"])),
     ):
         table.add_row(key, str(value))
     console.print(table)
@@ -1937,7 +1949,7 @@ def render_file_history(rows: list[sqlite3.Row], plaintext: bool) -> None:
             row["run_id"],
             row["recorded_at"],
             row["pack_id"],
-            str(row["size"]),
+            format_int(row["size"]),
             row["mtime"] or "",
         )
     console.print(table)
@@ -2157,12 +2169,12 @@ def catalog_run_cmd(ctx: click.Context, run_id: str, plaintext: bool) -> None:
             ("Status", run_row["status"]),
             ("Machine", run_row["machine"] or ""),
             ("Source", run_row["source_path"]),
-            ("Files scanned", run_row["files_scanned"]),
-            ("Files new", run_row["files_new"]),
-            ("Files deduped", run_row["files_deduped"]),
-            ("Bytes new", run_row["bytes_new"]),
-            ("Bytes scanned", run_row["bytes_total_scanned"]),
-            ("Packs created", run_row["packs_created"]),
+            ("Files scanned", format_int(run_row["files_scanned"])),
+            ("Files new", format_int(run_row["files_new"])),
+            ("Files deduped", format_int(run_row["files_deduped"])),
+            ("Bytes new", format_int(run_row["bytes_new"])),
+            ("Bytes scanned", format_int(run_row["bytes_total_scanned"])),
+            ("Packs created", format_int(run_row["packs_created"])),
         ):
             table.add_row(key, str(value))
         console.print(table)

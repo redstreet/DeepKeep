@@ -901,7 +901,7 @@ def test_backup_marks_run_failed_when_snapshot_errors(fake_crypto, repo: tuple[P
     assert "pack 1/1" in result.output
     assert " u " in result.output
     row = db_rows(config, "SELECT status, notes, files_new, packs_created FROM backup_runs ORDER BY started_at DESC")[0]
-    assert row[0] == "FAILED"
+    assert row[0] == "PARTIAL"
     assert row[1] == "catalog snapshot failed"
     assert row[2] == 1
     assert row[3] == 1
@@ -920,7 +920,7 @@ def test_backup_marks_run_failed_when_quick_check_errors(fake_crypto, repo: tupl
     assert result.exit_code != 0
     assert "catalog quick check failed" in result.output
     row = db_rows(config, "SELECT status, notes FROM backup_runs ORDER BY started_at DESC")[0]
-    assert row[0] == "FAILED"
+    assert row[0] == "PARTIAL"
     assert row[1] == "catalog quick check failed"
 
 
@@ -940,7 +940,30 @@ def test_new_backup_marks_stale_running_rows_failed(fake_crypto, repo: tuple[Pat
     assert result.exit_code == 0, result.output
     stale = db_rows(config, "SELECT status, notes FROM backup_runs WHERE run_id = 'stale123'")[0]
     assert stale[0] == "FAILED"
-    assert "marked failed after a later backup detected an unfinished run" in stale[1]
+    assert "marked incomplete after a later backup detected an unfinished run" in stale[1]
+
+
+def test_new_backup_marks_stale_running_rows_partial_when_committed_packs_exist(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, _, config = repo
+    config_data = deepkeep.load_config(config)
+    db = deepkeep.connect_db(config_data)
+    db.execute(
+        "INSERT INTO backup_runs(run_id, started_at, machine, source_path, status) VALUES (?, ?, ?, ?, ?)",
+        ("partial123", "2026-04-09T03:17:38Z", "LIONLAP", "/tmp/source", "RUNNING"),
+    )
+    db.execute(
+        "INSERT INTO packs(pack_id, object_key, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("pack123", "packs/2026/04/pack-pack123.tar.age", "2026-04-09T03:18:00Z", "off", "age", 1, "partial123"),
+    )
+    db.commit()
+    db.close()
+
+    (source / "fresh.txt").write_text("fresh")
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code == 0, result.output
+    stale = db_rows(config, "SELECT status, notes FROM backup_runs WHERE run_id = 'partial123'")[0]
+    assert stale[0] == "PARTIAL"
+    assert "marked incomplete after a later backup detected an unfinished run" in stale[1]
 
 
 def test_backup_reports_failed_stage(fake_crypto, repo: tuple[Path, Path, Path], monkeypatch) -> None:
