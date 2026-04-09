@@ -111,7 +111,7 @@ class PackProgress:
 
     def build(self, total_bytes: int):
         if not self.live_enabled:
-            return _NullBuildProgress(self)
+            return _NullBarProgress(self, "build")
         progress = Progress(
             TextColumn(f"pack {self.pack_id}"),
             TextColumn("building"),
@@ -122,7 +122,22 @@ class PackProgress:
             transient=True,
         )
         task_id = progress.add_task("building", total=max(total_bytes, 1), completed=0)
-        return _BuildProgress(self, progress, task_id)
+        return _BarProgress(self, "build", progress, task_id)
+
+    def restore(self, total_bytes: int):
+        if not self.live_enabled:
+            return _NullBarProgress(self, "restore")
+        progress = Progress(
+            TextColumn(f"pack {self.pack_id}"),
+            TextColumn("restoring"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        )
+        task_id = progress.add_task("restoring", total=max(total_bytes, 1), completed=0)
+        return _BarProgress(self, "restore", progress, task_id)
 
     @contextmanager
     def stage(self, stage: str):
@@ -152,9 +167,10 @@ class PackProgress:
         self._finish(stage, started_at, ok=True)
 
 
-class _NullBuildProgress:
-    def __init__(self, owner: PackProgress) -> None:
+class _NullBarProgress:
+    def __init__(self, owner: PackProgress, stage: str) -> None:
         self.owner = owner
+        self.stage = stage
         self.started_at = 0.0
 
     def __enter__(self):
@@ -165,13 +181,14 @@ class _NullBuildProgress:
         return
 
     def __exit__(self, exc_type, exc, tb):
-        self.owner._finish("build", self.started_at, ok=exc is None)
+        self.owner._finish(self.stage, self.started_at, ok=exc is None)
         return False
 
 
-class _BuildProgress:
-    def __init__(self, owner: PackProgress, progress: Progress, task_id: int) -> None:
+class _BarProgress:
+    def __init__(self, owner: PackProgress, stage: str, progress: Progress, task_id: int) -> None:
         self.owner = owner
+        self.stage = stage
         self.progress = progress
         self.task_id = task_id
         self.started_at = 0.0
@@ -186,7 +203,7 @@ class _BuildProgress:
 
     def __exit__(self, exc_type, exc, tb):
         self.progress.stop()
-        self.owner._finish("build", self.started_at, ok=exc is None)
+        self.owner._finish(self.stage, self.started_at, ok=exc is None)
         return False
 
 
@@ -1012,11 +1029,17 @@ def plan_backup(db: sqlite3.Connection, config: dict[str, object], source: Path)
     return stats
 
 
-def fetch_pack(config: dict[str, object], backend: StorageBackend, object_key: str, workdir: Path) -> Path:
+def fetch_pack(config: dict[str, object], backend: StorageBackend, object_key: str, workdir: Path, progress: PackProgress | None = None) -> Path:
     enc_path = workdir / Path(object_key).name
     tar_path = workdir / enc_path.name.removesuffix(".age")
-    backend.get_object(object_key, str(enc_path))
-    decrypt_file(enc_path, tar_path, config)
+    if progress is None:
+        backend.get_object(object_key, str(enc_path))
+        decrypt_file(enc_path, tar_path, config)
+        return tar_path
+    with progress.stage("download"):
+        backend.get_object(object_key, str(enc_path))
+    with progress.stage("decrypt"):
+        decrypt_file(enc_path, tar_path, config)
     return tar_path
 
 
@@ -1042,7 +1065,7 @@ def restore_prefixes(
     if as_of_run is None:
         rows = db.execute(
             """
-            SELECT fp.path, fp.mtime, fp.sha256, f.pack_id, f.tar_path, p.object_key, p.backend_name
+            SELECT fp.path, fp.mtime, fp.sha256, f.size, f.pack_id, f.tar_path, p.object_key, p.backend_name
             FROM file_paths fp
             JOIN files f ON f.sha256 = fp.sha256
             JOIN packs p ON p.pack_id = f.pack_id
@@ -1055,7 +1078,7 @@ def restore_prefixes(
             raise DeepKeepError(f"unknown run_id: {as_of_run}")
         rows = db.execute(
             """
-            SELECT pv.path, pv.mtime, pv.sha256, f.pack_id, f.tar_path, p.object_key, p.backend_name
+            SELECT pv.path, pv.mtime, pv.sha256, f.size, f.pack_id, f.tar_path, p.object_key, p.backend_name
             FROM path_versions pv
             JOIN backup_runs br ON br.run_id = pv.run_id
             JOIN files f ON f.sha256 = pv.sha256
@@ -1085,44 +1108,54 @@ def restore_prefixes(
         for rows_in_pack in by_pack.values():
             backend = get_backend(config, rows_in_pack[0]["backend_name"] if backend_name is None else backend_name)
             object_key = rows_in_pack[0]["object_key"]
-            status = backend.request_restore(object_key)
+            pack_progress = PackProgress(rows_in_pack[0]["pack_id"])
+            with pack_progress.stage("check"):
+                status = backend.restore_status(object_key)
             if status != "ready":
+                if status == "cold":
+                    with pack_progress.stage("requesting restore"):
+                        status = backend.request_restore(object_key)
                 pending += 1
                 continue
-            tar_path = fetch_pack(config, backend, object_key, tmpdir)
+            tar_path = fetch_pack(config, backend, object_key, tmpdir, progress=pack_progress)
             with tarfile.open(tar_path) as tf:
-                for row in rows_in_pack:
-                    rel = row["path"]
-                    target = dest / rel
-                    if target.exists() and not force:
-                        continue
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    if force:
-                        remove_existing_target(target)
-                    canonical = canonical_by_hash.get(row["sha256"])
-                    if canonical is None:
-                        member = tf.extractfile(row["tar_path"])
-                        if member is None:
-                            raise DeepKeepError(f"missing member in pack: {row['tar_path']}")
-                        data = member.read()
-                        digest = hashlib.sha256(data).hexdigest()
-                        if digest != row["sha256"]:
-                            raise DeepKeepError(f"hash mismatch while restoring {rel}")
-                        target.write_bytes(data)
-                        apply_mtime(target, row["mtime"])
-                        canonical_by_hash[row["sha256"]] = (target, rel)
-                    else:
-                        canonical_target, canonical_rel = canonical
-                        if is_windows_platform():
-                            write_pointer_file(target, canonical_rel, canonical_target, row["sha256"], row["mtime"])
-                        elif is_linux_platform() and not no_hardlinks:
-                            try:
-                                os.link(canonical_target, target)
-                            except OSError:
-                                write_full_copy(target, canonical_target, row["mtime"])
+                with pack_progress.restore(sum(int(row["size"]) for row in rows_in_pack)) as restore_progress:
+                    for row in rows_in_pack:
+                        rel = row["path"]
+                        target = dest / rel
+                        if target.exists() and not force:
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        if force:
+                            remove_existing_target(target)
+                        canonical = canonical_by_hash.get(row["sha256"])
+                        logical_size = 0
+                        if canonical is None:
+                            member = tf.extractfile(row["tar_path"])
+                            if member is None:
+                                raise DeepKeepError(f"missing member in pack: {row['tar_path']}")
+                            data = member.read()
+                            digest = hashlib.sha256(data).hexdigest()
+                            if digest != row["sha256"]:
+                                raise DeepKeepError(f"hash mismatch while restoring {rel}")
+                            target.write_bytes(data)
+                            logical_size = len(data)
+                            apply_mtime(target, row["mtime"])
+                            canonical_by_hash[row["sha256"]] = (target, rel)
                         else:
-                            write_full_copy(target, canonical_target, row["mtime"])
-                    restored += 1
+                            canonical_target, canonical_rel = canonical
+                            logical_size = int(row["size"])
+                            if is_windows_platform():
+                                write_pointer_file(target, canonical_rel, canonical_target, row["sha256"], row["mtime"])
+                            elif is_linux_platform() and not no_hardlinks:
+                                try:
+                                    os.link(canonical_target, target)
+                                except OSError:
+                                    write_full_copy(target, canonical_target, row["mtime"])
+                            else:
+                                write_full_copy(target, canonical_target, row["mtime"])
+                        restore_progress.advance(logical_size)
+                        restored += 1
     return restored, pending
 
 

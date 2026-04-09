@@ -289,6 +289,10 @@ def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, 
         cli_args(config, "restore", "--dest", str(dest), "a/"),
     )
     assert result.exit_code == 0, result.output
+    assert " check finished in " in result.output
+    assert " download finished in " in result.output
+    assert " decrypt finished in " in result.output
+    assert " restore finished in " in result.output
     assert (dest / "a" / "one.txt").read_text() == "one"
     assert (dest / "a" / "two.txt").read_text() == "two"
     assert not (dest / "dup.txt").exists()
@@ -703,6 +707,27 @@ def test_restore_as_of_run_requires_known_run(fake_crypto, repo: tuple[Path, Pat
     )
     assert result.exit_code != 0
     assert "Error: unknown run_id: missing-run" in result.output
+
+
+def test_restore_reports_pending_archive_pack(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path, monkeypatch) -> None:
+    source, _, _, config = repo
+    (source / "cold.txt").write_text("cold")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code == 0, result.output
+
+    statuses = iter(["cold", "pending"])
+
+    def fake_restore_status(self, key: str) -> str:
+        return next(statuses)
+
+    monkeypatch.setattr(deepkeep.LocalBackend, "restore_status", fake_restore_status)
+    dest = tmp_path / "restore"
+    result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(dest), "cold"))
+    assert result.exit_code == 0, result.output
+    assert " check finished in " in result.output
+    assert " requesting restore finished in " in result.output
+    assert "packs pending glacier restore: 1" in result.output
 
 
 def test_cli_reports_deepkeep_errors_cleanly(fake_crypto, repo: tuple[Path, Path, Path, Path], monkeypatch) -> None:
