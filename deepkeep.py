@@ -1134,8 +1134,8 @@ def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: Storag
 
 def backup_source(config: dict[str, object], source: Path, dry_run: bool = False) -> dict[str, int]:
     db = connect_db(config)
-    planned = plan_backup(db, config, source)
     if dry_run:
+        planned = plan_backup(db, config, source)
         db.close()
         return planned
     prescan = pre_scan_source(config, source)
