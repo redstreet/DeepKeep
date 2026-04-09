@@ -484,7 +484,9 @@ class S3Backend:
 
     def list_objects(self, prefix: str) -> list[str]:
         uri = self._uri(prefix)
-        proc = run(["aws", "s3", "ls", uri, "--recursive"])
+        proc = run(["aws", "s3", "ls", uri, "--recursive"], check=False)
+        if proc.returncode != 0:
+            return []
         keys = []
         base = f"{self.prefix}/".strip("/")
         for line in proc.stdout.splitlines():

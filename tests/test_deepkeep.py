@@ -141,6 +141,20 @@ def test_snapshot_catalog_writes_latest_every_run_but_weekly_snapshots(tmp_path:
     assert len(snapshots) == 1
 
 
+def test_s3_list_objects_returns_empty_for_missing_prefix(monkeypatch) -> None:
+    monkeypatch.setattr(deepkeep, "require_tool", lambda name: None)
+    backend = deepkeep.S3Backend(
+        "glacier",
+        {"type": "s3", "bucket": "deepkeeptest", "prefix": "dkt", "storage_class": "DEEP_ARCHIVE"},
+    )
+
+    def fake_run(args, **kwargs):
+        return deepkeep.subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="NoSuchKey")
+
+    monkeypatch.setattr(deepkeep, "run", fake_run)
+    assert backend.list_objects("catalog/snapshots") == []
+
+
 def test_backup_restore_verify_and_rebuild(fake_crypto, repo: tuple[Path, Path, Path, Path], tmp_path: Path) -> None:
     source, storage, _, config = repo
     (source / "a").mkdir()
