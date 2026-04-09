@@ -483,27 +483,21 @@ def load_config(path: Path) -> dict[str, object]:
     data["work_root"] = expand_config_path(str(data["work_root"]))
     if "age_pass_entry" not in data:
         raise DeepKeepError("config must define age_pass_entry")
-    backends = data.get("backends")
-    if not isinstance(backends, dict) or not backends:
-        raise DeepKeepError("config.backends must be a non-empty mapping")
-    default_backend = str(data.get("default_backend", ""))
-    if not default_backend or default_backend not in backends:
-        raise DeepKeepError("config.default_backend must name one of config.backends")
-    for name, cfg in backends.items():
-        if not isinstance(cfg, dict):
-            raise DeepKeepError(f"config.backends.{name} must be a mapping")
-        backend_type = cfg.get("type")
-        if backend_type == "local":
-            if "root" not in cfg:
-                raise DeepKeepError(f"config.backends.{name}.root is required for local backend")
-            cfg["root"] = expand_config_path(str(cfg["root"]))
-        elif backend_type == "s3":
-            for key in ("bucket", "prefix"):
-                if key not in cfg:
-                    raise DeepKeepError(f"config.backends.{name}.{key} is required for s3 backend")
-            cfg.setdefault("storage_class", "DEEP_ARCHIVE")
-        else:
-            raise DeepKeepError(f"config.backends.{name}.type must be 'local' or 's3'")
+    cfg = data.get("backend")
+    if not isinstance(cfg, dict):
+        raise DeepKeepError("config.backend must be a mapping")
+    backend_type = cfg.get("type")
+    if backend_type == "local":
+        if "root" not in cfg:
+            raise DeepKeepError("config.backend.root is required for local backend")
+        cfg["root"] = expand_config_path(str(cfg["root"]))
+    elif backend_type == "s3":
+        for key in ("bucket", "prefix"):
+            if key not in cfg:
+                raise DeepKeepError(f"config.backend.{key} is required for s3 backend")
+        cfg.setdefault("storage_class", "DEEP_ARCHIVE")
+    else:
+        raise DeepKeepError("config.backend.type must be 'local' or 's3'")
     return data
 
 
@@ -617,8 +611,7 @@ def connect_db(config: dict[str, object]) -> sqlite3.Connection:
     pack_columns = {row["name"] for row in db.execute("PRAGMA table_info(packs)").fetchall()}
     if "backend_name" not in pack_columns:
         db.execute("ALTER TABLE packs ADD COLUMN backend_name TEXT NOT NULL DEFAULT ''")
-    default_backend = get_default_backend_name(config)
-    db.execute("UPDATE packs SET backend_name = ? WHERE backend_name = '' OR backend_name IS NULL", (default_backend,))
+    db.execute("UPDATE packs SET backend_name = ? WHERE backend_name = '' OR backend_name IS NULL", (get_backend(config).backend_name,))
     db.commit()
     return db
 
@@ -904,19 +897,11 @@ class S3Backend:
         return "pending"
 
 
-def get_backend(config: dict[str, object], backend_name: str) -> StorageBackend:
-    cfg = config["backends"][backend_name]
+def get_backend(config: dict[str, object]) -> StorageBackend:
+    cfg = config["backend"]
     if cfg["type"] == "local":
-        return LocalBackend(backend_name, Path(cfg["root"]))
-    return S3Backend(backend_name, cfg)
-
-
-def get_default_backend_name(config: dict[str, object]) -> str:
-    return str(config["default_backend"])
-
-
-def get_default_backend(config: dict[str, object]) -> StorageBackend:
-    return get_backend(config, get_default_backend_name(config))
+        return LocalBackend("local", Path(cfg["root"]))
+    return S3Backend("s3", cfg)
 
 
 def stage_root(config: dict[str, object]) -> Path:
@@ -1032,9 +1017,8 @@ def resume_pending(config: dict[str, object], db: sqlite3.Connection, backend: S
     for state_path in sorted(stage_root(config).glob("packs/*/state.json")):
         stage = read_stage(state_path)
         enc = stage.enc_file()
-        stage_backend = get_backend(config, stage.backend_name)
         if stage.status == "ENCRYPTED":
-            stage_backend.put_object(stage.object_key, str(enc))
+            backend.put_object(stage.object_key, str(enc))
             stage.status = "UPLOADED"
             write_stage(state_path, stage)
         if stage.status == "UPLOADED":
@@ -1107,7 +1091,7 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
         return planned
     prescan = pre_scan_source(config, source)
 
-    backend = get_default_backend(config)
+    backend = get_backend(config)
     resume_pending(config, db, backend)
     fail_stale_runs(db)
     run_id, started = start_backup_run(db, source)
@@ -1325,11 +1309,10 @@ def select_restore_rows(
     return [row for row in rows if any(row["path"].startswith(prefix) for prefix in prefixes)]
 
 
-def group_restore_rows(rows: list[sqlite3.Row], backend_name: str | None) -> dict[tuple[str, str], list[sqlite3.Row]]:
-    by_pack: dict[tuple[str, str], list[sqlite3.Row]] = defaultdict(list)
+def group_restore_rows(rows: list[sqlite3.Row]) -> dict[str, list[sqlite3.Row]]:
+    by_pack: dict[str, list[sqlite3.Row]] = defaultdict(list)
     for row in rows:
-        source_backend = backend_name or row["backend_name"]
-        by_pack[(source_backend, row["pack_id"])].append(row)
+        by_pack[row["pack_id"]].append(row)
     return by_pack
 
 
@@ -1418,7 +1401,6 @@ def restore_prefixes(
     force: bool = False,
     restore_all: bool = False,
     no_hardlinks: bool = False,
-    backend_name: str | None = None,
     as_of_run: str | None = None,
 ) -> tuple[int, int]:
     db = connect_db(config)
@@ -1426,14 +1408,14 @@ def restore_prefixes(
         matches = select_restore_rows(db, prefixes, restore_all, as_of_run)
         if not matches:
             return 0, 0
-        by_pack = group_restore_rows(matches, backend_name)
+        by_pack = group_restore_rows(matches)
         restored = 0
         pending = 0
         canonical_by_hash: dict[str, tuple[Path, str]] = {}
+        backend = get_backend(config)
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             for rows_in_pack in by_pack.values():
-                backend = get_backend(config, rows_in_pack[0]["backend_name"] if backend_name is None else backend_name)
                 object_key = rows_in_pack[0]["object_key"]
                 pack_progress = PackProgress(rows_in_pack[0]["pack_id"])
                 status = restore_pack_ready(backend, object_key, pack_progress)
@@ -1456,12 +1438,12 @@ def restore_prefixes(
         db.close()
 
 
-def verify_pack(config: dict[str, object], pack_id: str, backend_name: str | None = None) -> list[str]:
+def verify_pack(config: dict[str, object], pack_id: str) -> list[str]:
     db = connect_db(config)
     row = db.execute("SELECT object_key, backend_name FROM packs WHERE pack_id = ?", (pack_id,)).fetchone()
     if row is None:
         raise DeepKeepError(f"unknown pack_id: {pack_id}")
-    backend = get_backend(config, backend_name or row["backend_name"])
+    backend = get_backend(config)
     issues: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
         tar_path = fetch_pack(config, backend, row["object_key"], Path(tmp))
@@ -1478,9 +1460,9 @@ def verify_pack(config: dict[str, object], pack_id: str, backend_name: str | Non
     return issues
 
 
-def rebuild_catalog(config: dict[str, object], backend_name: str) -> int:
+def rebuild_catalog(config: dict[str, object]) -> int:
     db = connect_db(config)
-    backend = get_backend(config, backend_name)
+    backend = get_backend(config)
     db.execute("DELETE FROM file_paths")
     db.execute("DELETE FROM files")
     db.execute("DELETE FROM packs")
@@ -1497,7 +1479,7 @@ def rebuild_catalog(config: dict[str, object], backend_name: str) -> int:
             created_at = str(manifest.get("created_at", utc_now()))
             db.execute(
                 "INSERT OR REPLACE INTO packs(pack_id, object_key, backend_name, created_at, compression, encryption, uploaded, run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (pack_id, key, backend_name, created_at, "off", "age", 1, "rebuild"),
+                (pack_id, key, backend.backend_name, created_at, "off", "age", 1, "rebuild"),
             )
             for item in manifest["files"]:
                 db.execute(
@@ -1889,7 +1871,6 @@ def backup(ctx: click.Context, dry_run: bool, source: Path) -> None:
 @click.option("--dest", type=click.Path(path_type=Path), required=True)
 @click.option("--all", "restore_all", is_flag=True, help="Restore the entire catalog.")
 @click.option("--as-of-run", help="Restore the latest versions known at or before the given run.")
-@click.option("--backend", "restore_backend", help="Override the backend/profile used to fetch packs.")
 @click.option("--no-hardlinks", is_flag=True, help="Do not restore duplicate files as hardlinks on Linux.")
 @click.option("--force", is_flag=True, help="Overwrite files already present at the destination.")
 @click.argument("prefixes", nargs=-1)
@@ -1899,7 +1880,6 @@ def restore_cmd(
     dest: Path,
     restore_all: bool,
     as_of_run: str | None,
-    restore_backend: str | None,
     no_hardlinks: bool,
     force: bool,
     prefixes: tuple[str, ...],
@@ -1910,8 +1890,6 @@ def restore_cmd(
     if not restore_all and not prefixes:
         raise click.UsageError("provide at least one path prefix, or use --all")
     config = current_config(ctx)
-    if restore_backend is not None:
-        get_backend(config, restore_backend)
     restored, pending = restore_prefixes(
         config,
         prefixes,
@@ -1919,7 +1897,6 @@ def restore_cmd(
         force=force,
         restore_all=restore_all,
         no_hardlinks=no_hardlinks,
-        backend_name=restore_backend,
         as_of_run=as_of_run,
     )
     console.print(f"restored: {restored}")
@@ -1928,15 +1905,12 @@ def restore_cmd(
 
 
 @cli.command("verify-pack")
-@click.option("--backend", "verify_backend", help="Override the backend/profile used to fetch the pack.")
 @click.argument("pack_id")
 @click.pass_context
-def verify_pack_cmd(ctx: click.Context, verify_backend: str | None, pack_id: str) -> None:
+def verify_pack_cmd(ctx: click.Context, pack_id: str) -> None:
     """Verify MANIFEST.json entries against pack contents."""
     config = current_config(ctx)
-    if verify_backend is not None:
-        get_backend(config, verify_backend)
-    issues = verify_pack(config, pack_id, backend_name=verify_backend)
+    issues = verify_pack(config, pack_id)
     if issues:
         for issue in issues:
             console.print(f"[red]{issue}[/red]")
@@ -1958,13 +1932,11 @@ def verify_catalog_cmd(ctx: click.Context) -> None:
 
 
 @cli.command("rebuild-catalog")
-@click.option("--backend", "rebuild_backend", required=True, help="Backend/profile to scan for packs.")
 @click.pass_context
-def rebuild_catalog_cmd(ctx: click.Context, rebuild_backend: str) -> None:
+def rebuild_catalog_cmd(ctx: click.Context) -> None:
     """Rebuild SQLite from embedded manifests."""
     config = current_config(ctx)
-    get_backend(config, rebuild_backend)
-    count = rebuild_catalog(config, rebuild_backend)
+    count = rebuild_catalog(config)
     console.print(f"rebuilt catalog from {count} pack(s)")
 
 
