@@ -202,6 +202,18 @@ def error_note(exc: Exception) -> str:
     return message.splitlines()[0] if message else "backup failed"
 
 
+def format_bytes(value: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    size = float(value)
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{value} B"
+
+
 def require_tool(name: str) -> None:
     if shutil.which(name):
         return
@@ -774,6 +786,13 @@ def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: Storag
 
 
 def backup_source(config: dict[str, object], source: Path, dry_run: bool = False) -> dict[str, int]:
+    if dry_run:
+        db = connect_db(config)
+        try:
+            return plan_backup(db, config, source)
+        finally:
+            db.close()
+
     db = connect_db(config)
     backend = get_default_backend(config)
     resume_pending(config, db, backend)
@@ -845,6 +864,30 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
         raise
     finally:
         db.close()
+
+
+def plan_backup(db: sqlite3.Connection, config: dict[str, object], source: Path) -> dict[str, int]:
+    stats = {"files_scanned": 0, "files_new": 0, "files_deduped": 0, "bytes_new": 0, "bytes_total_scanned": 0, "packs_created": 0}
+    target = int(config["pack_size_mb"]) * 1024 * 1024
+    current_size = 0
+    run_hashes: set[str] = set()
+    for path in iter_files(source):
+        entry = build_entry(source, path)
+        stats["files_scanned"] += 1
+        stats["bytes_total_scanned"] += entry.size
+        if entry.sha256 in run_hashes or has_hash(db, entry.sha256):
+            stats["files_deduped"] += 1
+            continue
+        stats["files_new"] += 1
+        stats["bytes_new"] += entry.size
+        run_hashes.add(entry.sha256)
+        current_size += entry.size
+        if current_size >= target:
+            stats["packs_created"] += 1
+            current_size = 0
+    if current_size > 0:
+        stats["packs_created"] += 1
+    return stats
 
 
 def fetch_pack(config: dict[str, object], backend: StorageBackend, object_key: str, workdir: Path) -> Path:
@@ -1356,8 +1399,19 @@ def backup(config_path: Path, dry_run: bool, source: Path) -> None:
     table = Table(title="Backup Summary")
     table.add_column("Metric")
     table.add_column("Value", justify="right")
-    for key, value in stats.items():
-        table.add_row(key, str(value))
+    rows = [
+        ("Mode", "dry run" if dry_run else "backup"),
+        ("Files scanned", str(stats["files_scanned"])),
+        ("Files to back up", str(stats["files_new"])),
+        ("Files deduped", str(stats["files_deduped"])),
+        ("Estimated packs", str(stats["packs_created"])),
+        ("New data", format_bytes(stats["bytes_new"])),
+        ("New data bytes", str(stats["bytes_new"])),
+        ("Scanned data", format_bytes(stats["bytes_total_scanned"])),
+        ("Scanned bytes", str(stats["bytes_total_scanned"])),
+    ]
+    for key, value in rows:
+        table.add_row(key, value)
     console.print(table)
 
 

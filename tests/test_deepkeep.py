@@ -194,6 +194,46 @@ def test_s3_restore_status_uses_restore_header_for_archive_storage(monkeypatch) 
     assert backend.restore_status("packs/x.tar.age") == "pending"
 
 
+def test_backup_dry_run_is_non_mutating_and_human_readable(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, storage, _, config = repo
+    (source / "alpha.txt").write_text("alpha")
+    (source / "beta.txt").write_text("beta")
+
+    result = CliRunner().invoke(deepkeep.cli, ["backup", "--config", str(config), "--dry-run", str(source)])
+    assert result.exit_code == 0, result.output
+    assert "Mode" in result.output
+    assert "dry run" in result.output
+    assert "Files to back up" in result.output
+    assert "New data" in result.output
+    assert "B" in result.output
+
+    assert db_rows(config, "SELECT * FROM backup_runs") == []
+    assert db_rows(config, "SELECT * FROM file_paths") == []
+    assert db_rows(config, "SELECT * FROM run_files") == []
+    assert db_rows(config, "SELECT * FROM path_versions") == []
+    assert db_rows(config, "SELECT * FROM packs") == []
+    assert list(storage.rglob("*")) == []
+    assert not (config.parent / ".work").exists()
+
+
+def test_backup_dry_run_matches_real_backup_stats(fake_crypto, repo: tuple[Path, Path, Path, Path]) -> None:
+    source, _, _, config = repo
+    (source / "a.txt").write_text("one")
+    (source / "b.txt").write_text("two")
+    runner = CliRunner()
+
+    dry = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), "--dry-run", str(source)])
+    assert dry.exit_code == 0, dry.output
+    real = runner.invoke(deepkeep.cli, ["backup", "--config", str(config), str(source)])
+    assert real.exit_code == 0, real.output
+
+    assert "Files to back up" in dry.output
+    assert "2" in dry.output
+    row = db_rows(config, "SELECT files_new, packs_created FROM backup_runs ORDER BY started_at DESC")[0]
+    assert row[0] == 2
+    assert row[1] == 1
+
+
 def test_run_formats_called_process_error(monkeypatch) -> None:
     def boom(*args, **kwargs):
         raise deepkeep.subprocess.CalledProcessError(
