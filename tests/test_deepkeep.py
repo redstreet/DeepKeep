@@ -121,6 +121,43 @@ def test_load_config_expands_user_and_env_paths(tmp_path: Path, monkeypatch) -> 
     assert loaded["backend"]["root"] == str(local_root / "archive")
 
 
+def test_default_catalog_path_does_not_require_gz_suffix(tmp_path: Path) -> None:
+    config = tmp_path / "deepkeep.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "pack_size_mb: 1",
+                "age_pass_entry: backups/deepkeep",
+                f"work_root: {tmp_path / '.work'}",
+                "backend:",
+                "  type: local",
+                f"  root: {tmp_path / 'storage'}",
+            ]
+        )
+    )
+
+    loaded = deepkeep.load_config(config)
+
+    assert loaded["catalog_path"] == str(tmp_path / "deepkeep.sqlite")
+
+
+def test_resolve_catalog_path_finds_gz_sibling_when_configured_path_is_absent(tmp_path: Path) -> None:
+    configured = tmp_path / "catalog.sqlite"
+    gz = tmp_path / "catalog.sqlite.gz"
+    gz.write_bytes(b"placeholder")
+
+    assert deepkeep.resolve_catalog_path(configured) == gz
+
+
+def test_resolve_catalog_path_prefers_exact_configured_path(tmp_path: Path) -> None:
+    configured = tmp_path / "catalog.sqlite"
+    gz = tmp_path / "catalog.sqlite.gz"
+    configured.write_bytes(b"plain")
+    gz.write_bytes(b"compressed")
+
+    assert deepkeep.resolve_catalog_path(configured) == configured
+
+
 def test_should_write_catalog_snapshot_weekly_policy() -> None:
     now = "2026-04-07T12:00:00Z"
     assert deepkeep.should_write_catalog_snapshot(now, []) is True
@@ -248,6 +285,26 @@ def test_readonly_catalog_open_does_not_gunzip_in_place(fake_crypto, repo: tuple
     assert deepkeep.is_gzip_file(catalog)
     assert db_rows(config_path, "SELECT COUNT(*) FROM backup_runs")[0][0] == 1
     assert deepkeep.is_gzip_file(catalog)
+
+
+def test_catalog_command_reads_gz_sibling_when_config_omits_gz(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, _, config_path = repo
+    (source / "one.txt").write_text("one")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, cli_args(config_path, "backup", str(source)))
+    assert result.exit_code == 0, result.output
+
+    config = deepkeep.load_config(config_path)
+    configured = Path(str(config["catalog_path"]))
+    sibling = deepkeep.gzip_sibling(configured)
+    configured.rename(sibling)
+
+    result = runner.invoke(deepkeep.cli, cli_args(config_path, "catalog", "files"))
+    assert result.exit_code == 0, result.output
+    assert "one.txt" in result.output
+    assert "none" not in result.output
+    assert sibling.exists()
+    assert not configured.exists()
 
 
 def test_remote_catalog_snapshot_includes_completed_status(fake_crypto, repo: tuple[Path, Path, Path]) -> None:

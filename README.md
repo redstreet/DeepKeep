@@ -75,7 +75,7 @@ The first real backup binds the catalog to that exact backend config. If you lat
 ## Local Backend Example
 
 ```yaml
-catalog_path: /path/to/catalog.sqlite.gz
+catalog_path: /path/to/catalog.sqlite
 pack_size_mb: 512
 age_pass_entry: backups/deepkeep
 work_root: /path/to/work
@@ -88,7 +88,7 @@ backend:
 ## S3 Backend Example
 
 ```yaml
-catalog_path: /path/to/catalog.sqlite.gz
+catalog_path: /path/to/catalog.sqlite
 pack_size_mb: 512
 age_pass_entry: backups/deepkeep
 work_root: /path/to/work
@@ -102,7 +102,7 @@ backend:
 
 Field notes:
 
-- `catalog_path`: path to the local catalog; DeepKeep normally stores it gzip-compressed, but plain SQLite is also accepted after an interrupted run
+- `catalog_path`: path to the local catalog; the file contents may be gzip-compressed even if the name does not end in `.gz`
 - `pack_size_mb`: minimum pack target size
 - `age_pass_entry`: `pass` entry holding the encryption passphrase
 - `work_root`: local staging directory for in-progress packs
@@ -172,7 +172,7 @@ aws s3 ls
 3. Create a config file, for example `deepkeep.yaml`:
 
 ```yaml
-catalog_path: /absolute/path/to/catalog.sqlite.gz
+catalog_path: /absolute/path/to/catalog.sqlite
 pack_size_mb: 512
 age_pass_entry: backups/deepkeep
 work_root: /absolute/path/to/work

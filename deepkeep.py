@@ -522,7 +522,7 @@ def load_config(path: Path) -> dict[str, object]:
     if not isinstance(data, dict):
         raise DeepKeepError("config must be a YAML mapping")
     data.setdefault("pack_size_mb", PACK_MIN_MB)
-    data.setdefault("catalog_path", str(path.with_suffix(".sqlite.gz")))
+    data.setdefault("catalog_path", str(path.with_suffix(".sqlite")))
     data.setdefault("work_root", str(path.parent / ".deepkeep-work"))
     data["catalog_path"] = expand_config_path(str(data["catalog_path"]))
     data["work_root"] = expand_config_path(str(data["work_root"]))
@@ -610,6 +610,20 @@ def write_gunzip_file(src: Path, dest: Path) -> None:
     tmp.replace(dest)
 
 
+def gzip_sibling(path: Path) -> Path:
+    return Path(str(path) + ".gz")
+
+
+def resolve_catalog_path(configured_path: Path) -> Path:
+    if configured_path.exists():
+        return configured_path
+    if configured_path.suffix != ".gz":
+        sibling = gzip_sibling(configured_path)
+        if sibling.exists():
+            return sibling
+    return configured_path
+
+
 def gunzip_catalog_in_place(catalog_path: Path) -> None:
     if is_gzip_file(catalog_path):
         write_gunzip_file(catalog_path, catalog_path)
@@ -654,7 +668,7 @@ def close_db(db: sqlite3.Connection) -> None:
 
 
 def connect_db(config: dict[str, object], *, persist: bool = True) -> sqlite3.Connection:
-    catalog_path = Path(str(config["catalog_path"]))
+    catalog_path = resolve_catalog_path(Path(str(config["catalog_path"])))
     catalog_path.parent.mkdir(parents=True, exist_ok=True)
     if persist:
         gunzip_catalog_in_place(catalog_path)
@@ -1152,7 +1166,7 @@ def fail_stale_runs(db: sqlite3.Connection) -> None:
 def snapshot_catalog(config: dict[str, object], backend: StorageBackend, db: sqlite3.Connection | None = None) -> None:
     if db is not None:
         sync_catalog_db(db)
-    catalog = Path(str(config["catalog_path"]))
+    catalog = resolve_catalog_path(Path(str(config["catalog_path"])))
     if not catalog.exists():
         return
     ts = utc_now()
