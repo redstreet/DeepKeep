@@ -389,6 +389,8 @@ def test_backup_dry_run_is_non_mutating_and_human_readable(fake_crypto, repo: tu
     assert "Files to back up" in result.output
     assert "New data" in result.output
     assert "B" in result.output
+    assert "Dry run: scanning source size..." in result.output
+    assert "Dry run: hashing files and checking catalog dedupe..." in result.output
 
     assert db_rows(config, "SELECT * FROM backup_runs") == []
     assert db_rows(config, "SELECT * FROM file_paths") == []
@@ -397,6 +399,19 @@ def test_backup_dry_run_is_non_mutating_and_human_readable(fake_crypto, repo: tu
     assert db_rows(config, "SELECT * FROM packs") == []
     assert list(storage.rglob("*")) == []
     assert not (config.parent / ".work").exists()
+
+
+def test_backup_dry_run_handles_empty_source(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, storage, config = repo
+
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config, "backup", "--dry-run", str(source)))
+
+    assert result.exit_code == 0, result.output
+    assert "Dry run: scanning source size..." in result.output
+    assert "Dry run: hashing files and checking catalog dedupe..." in result.output
+    assert "Files scanned" in result.output
+    assert db_rows(config, "SELECT * FROM backup_runs") == []
+    assert list(storage.rglob("*")) == []
 
 
 def test_backup_dry_run_matches_real_backup_stats(fake_crypto, repo: tuple[Path, Path, Path]) -> None:

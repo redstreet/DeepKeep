@@ -343,6 +343,24 @@ class ScanProgress:
         return False
 
 
+@contextmanager
+def spinner_phase(message: str):
+    console.print(message)
+    if not console.is_terminal:
+        yield
+        return
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn(message),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    )
+    progress.add_task(message, total=None)
+    with progress:
+        yield
+
+
 def utc_now() -> str:
     return datetime.now(UTC).strftime(ISO)
 
@@ -1304,9 +1322,13 @@ def seal_pack(config: dict[str, object], db: sqlite3.Connection, backend: Storag
 def backup_source(config: dict[str, object], source: Path, dry_run: bool = False) -> dict[str, int]:
     db = connect_db(config, persist=not dry_run)
     if dry_run:
-        planned = plan_backup(db, config, source)
-        close_db(db)
-        return planned
+        try:
+            with spinner_phase("Dry run: scanning source size..."):
+                prescan = pre_scan_source(config, source)
+            console.print("Dry run: hashing files and checking catalog dedupe...")
+            return plan_backup(db, config, source, progress_total=prescan["bytes_total_scanned"])
+        finally:
+            close_db(db)
     prescan = pre_scan_source(config, source)
 
     backend = get_backend(config)
