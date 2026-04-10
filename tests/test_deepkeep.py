@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import socket
+import sqlite3
 import sys
 import tarfile
 import gzip
@@ -198,6 +199,72 @@ def test_backup_writes_local_catalog_as_gzip(fake_crypto, repo: tuple[Path, Path
     with gzip.open(catalog, "rb") as fh:
         header = fh.read(16)
     assert header.startswith(b"SQLite format 3")
+
+
+def test_mutating_catalog_open_gunzips_in_place_and_close_gzips(repo: tuple[Path, Path, Path]) -> None:
+    _, _, config_path = repo
+    config = deepkeep.load_config(config_path)
+    catalog = Path(str(config["catalog_path"]))
+    db = deepkeep.connect_db(config)
+    deepkeep.close_db(db)
+    assert deepkeep.is_gzip_file(catalog)
+
+    db = deepkeep.connect_db(config)
+    assert catalog.exists()
+    assert not deepkeep.is_gzip_file(catalog)
+    db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", ("test", "value"))
+    deepkeep.close_db(db)
+
+    assert deepkeep.is_gzip_file(catalog)
+    assert db_rows(config_path, "SELECT value FROM settings WHERE key = 'test'")[0][0] == "value"
+
+
+def test_plain_catalog_left_by_interruption_is_supported(repo: tuple[Path, Path, Path]) -> None:
+    _, _, config_path = repo
+    config = deepkeep.load_config(config_path)
+    db = deepkeep.connect_db(config)
+    db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", ("interrupted", "yes"))
+    db.commit()
+    deepkeep.CATALOG_DB_STATE.pop(id(db), None)
+    db.close()
+
+    catalog = Path(str(config["catalog_path"]))
+    assert not deepkeep.is_gzip_file(catalog)
+    assert db_rows(config_path, "SELECT value FROM settings WHERE key = 'interrupted'")[0][0] == "yes"
+
+    db = deepkeep.connect_db(config)
+    deepkeep.close_db(db)
+    assert deepkeep.is_gzip_file(catalog)
+
+
+def test_readonly_catalog_open_does_not_gunzip_in_place(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, _, config_path = repo
+    (source / "one.txt").write_text("one")
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config_path, "backup", str(source)))
+    assert result.exit_code == 0, result.output
+
+    config = deepkeep.load_config(config_path)
+    catalog = Path(str(config["catalog_path"]))
+    assert deepkeep.is_gzip_file(catalog)
+    assert db_rows(config_path, "SELECT COUNT(*) FROM backup_runs")[0][0] == 1
+    assert deepkeep.is_gzip_file(catalog)
+
+
+def test_remote_catalog_snapshot_includes_completed_status(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
+    source, storage, config_path = repo
+    (source / "one.txt").write_text("one")
+    result = CliRunner().invoke(deepkeep.cli, cli_args(config_path, "backup", str(source)))
+    assert result.exit_code == 0, result.output
+
+    latest = storage / "catalog" / "latest.sqlite.gz.age"
+    snapshot = config_path.parent / "snapshot.sqlite"
+    with gzip.open(latest, "rb") as inp, snapshot.open("wb") as out:
+        shutil.copyfileobj(inp, out)
+    db = sqlite3.connect(snapshot)
+    try:
+        assert db.execute("SELECT status FROM backup_runs").fetchone()[0] == "COMPLETED"
+    finally:
+        db.close()
 
 
 def test_s3_list_objects_returns_empty_for_missing_prefix(monkeypatch) -> None:

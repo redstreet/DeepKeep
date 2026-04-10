@@ -44,10 +44,9 @@ class DeepKeepError(RuntimeError):
 
 @dataclass
 class CatalogDbState:
-    temp_dir: Path
-    temp_path: Path
     catalog_path: Path
     persist: bool
+    temp_dir: Path | None = None
 
 
 CATALOG_DB_STATE: dict[int, CatalogDbState] = {}
@@ -603,7 +602,25 @@ def write_gzip_file(src: Path, dest: Path) -> None:
     tmp.replace(dest)
 
 
-def prepare_catalog_db(catalog_path: Path) -> tuple[Path, Path]:
+def write_gunzip_file(src: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    with gzip.open(src, "rb") as inp, tmp.open("wb") as out:
+        shutil.copyfileobj(inp, out)
+    tmp.replace(dest)
+
+
+def gunzip_catalog_in_place(catalog_path: Path) -> None:
+    if is_gzip_file(catalog_path):
+        write_gunzip_file(catalog_path, catalog_path)
+
+
+def gzip_catalog_in_place(catalog_path: Path) -> None:
+    if catalog_path.exists() and not is_gzip_file(catalog_path):
+        write_gzip_file(catalog_path, catalog_path)
+
+
+def prepare_readonly_catalog_db(catalog_path: Path) -> tuple[Path, Path]:
     temp_dir = Path(tempfile.mkdtemp(prefix="deepkeep-catalog-"))
     temp_path = temp_dir / "catalog.sqlite"
     if catalog_path.exists():
@@ -620,7 +637,6 @@ def sync_catalog_db(db: sqlite3.Connection) -> None:
     if state is None or not state.persist:
         return
     db.commit()
-    write_gzip_file(state.temp_path, state.catalog_path)
 
 
 def close_db(db: sqlite3.Connection) -> None:
@@ -631,16 +647,24 @@ def close_db(db: sqlite3.Connection) -> None:
     finally:
         CATALOG_DB_STATE.pop(id(db), None)
         db.close()
-        if state is not None:
+        if state is not None and state.persist:
+            gzip_catalog_in_place(state.catalog_path)
+        if state is not None and state.temp_dir is not None:
             shutil.rmtree(state.temp_dir, ignore_errors=True)
 
 
 def connect_db(config: dict[str, object], *, persist: bool = True) -> sqlite3.Connection:
     catalog_path = Path(str(config["catalog_path"]))
     catalog_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_dir, temp_path = prepare_catalog_db(catalog_path)
-    db = sqlite3.connect(str(temp_path))
-    CATALOG_DB_STATE[id(db)] = CatalogDbState(temp_dir=temp_dir, temp_path=temp_path, catalog_path=catalog_path, persist=persist)
+    if persist:
+        gunzip_catalog_in_place(catalog_path)
+        db_path = catalog_path
+        state = CatalogDbState(catalog_path=catalog_path, persist=True)
+    else:
+        temp_dir, db_path = prepare_readonly_catalog_db(catalog_path)
+        state = CatalogDbState(catalog_path=catalog_path, persist=False, temp_dir=temp_dir)
+    db = sqlite3.connect(str(db_path))
+    CATALOG_DB_STATE[id(db)] = state
     db.row_factory = sqlite3.Row
     db.executescript(
         """
@@ -1133,9 +1157,14 @@ def snapshot_catalog(config: dict[str, object], backend: StorageBackend, db: sql
         return
     ts = utc_now()
     with tempfile.TemporaryDirectory() as tmp:
+        gz = Path(tmp) / "catalog.sqlite.gz"
         enc = Path(tmp) / "catalog.sqlite.gz.age"
         try:
-            encrypt_file(catalog, enc, config)
+            if is_gzip_file(catalog):
+                shutil.copy2(catalog, gz)
+            else:
+                write_gzip_file(catalog, gz)
+            encrypt_file(gz, enc, config)
         except Exception as exc:
             raise wrap_error("catalog snapshot failed", exc) from exc
         latest_key, snap_key = catalog_object_keys(ts)
@@ -1322,9 +1351,9 @@ def backup_source(config: dict[str, object], source: Path, dry_run: bool = False
                     seal_pack(config, db, backend, state, f"{next_pack_number}/{pack_total}")
                 finally:
                     scan_progress.resume()
+        update_backup_run(db, run_id, stats, status="COMPLETED")
         quick_validate_catalog(db)
         snapshot_catalog(config, backend, db)
-        update_backup_run(db, run_id, stats, status="COMPLETED")
         return stats
     except Exception as exc:
         status = "PARTIAL" if run_has_committed_packs(db, run_id) else "FAILED"

@@ -102,7 +102,7 @@ backend:
 
 Field notes:
 
-- `catalog_path`: path to the local SQLite catalog
+- `catalog_path`: path to the local catalog; DeepKeep normally stores it gzip-compressed, but plain SQLite is also accepted after an interrupted run
 - `pack_size_mb`: minimum pack target size
 - `age_pass_entry`: `pass` entry holding the encryption passphrase
 - `work_root`: local staging directory for in-progress packs
@@ -226,6 +226,7 @@ Notes:
 
 - `catalog/latest.sqlite.gz.age` is uploaded on every successful backup
 - historical catalog snapshots are uploaded at most once per week
+- catalog uploads are compressed with gzip before age encryption
 - under the current implementation, catalog objects use the same backend and storage class as pack objects
 
 ## Commands
