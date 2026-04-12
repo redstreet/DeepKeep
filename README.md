@@ -1,9 +1,16 @@
 # DeepKeep
 
-DeepKeep is a single-file archival backup CLI for photos and videos.
+DeepKeep is a simple, single-script, archival backup system for photos and
+videos. It dedupes, encrypts, and spilts files for backup to the cloud.
 
-It:
+My primary goal was to use it to encrypt and backup photos/videos to Amazon S3 Glacier
+Deep Archive, which the script supports via AWS CLI.
 
+The primary design goal is to keep the output format so simple that if this script were
+to disappear or be rendered unusable, it would take you virtually no more than a couple
+basic unix tools (`tar` and `age` for encryption) to restore your backups. 
+
+DeepKeep:
 - scans a source directory in deterministic order
 - deduplicates at the file level by SHA-256
 - packs new files into tar archives
@@ -19,18 +26,13 @@ Required tools:
 - `pass`
 - `age`
 - `age-plugin-batchpass`
-- AWS CLI if you use the S3 backend
+- AWS CLI if you use the S3 backend (a local filesystem backend is available for
+  testing)
 
 Install Python dependencies:
 
 ```bash
 python3 -m pip install click PyYAML rich
-```
-
-Or use the shared virtualenv in this repo setup:
-
-```bash
-~/.venv/ai/bin/python deepkeep.py --help
 ```
 
 For command config selection:
@@ -60,7 +62,7 @@ DeepKeep reads the first line of that pass entry and sets `AGE_PASSPHRASE_FD` in
 
 ## Backend Selection
 
-DeepKeep uses exactly one backend in the YAML config.
+DeepKeep allows exactly one backend in the YAML config.
 
 ```yaml
 backend:
@@ -70,7 +72,9 @@ backend:
   storage_class: DEEP_ARCHIVE
 ```
 
-The first real backup binds the catalog to that exact backend config. If you later change the backend block for the same catalog, `backup` will fail instead of writing to a different target.
+The first real backup binds the catalog to that exact backend config. If you later
+change the backend block for the same catalog, `backup` will fail instead of writing to
+a different target.
 
 ## Local Backend Example
 
@@ -114,7 +118,8 @@ Field notes:
 
 ## AWS Authentication
 
-DeepKeep does not implement separate S3 authentication logic. It shells out to the AWS CLI, so it uses whatever credentials the AWS CLI is already using.
+DeepKeep does not implement separate S3 authentication logic. It shells out to the AWS
+CLI, so it uses whatever credentials the AWS CLI is already using.
 
 Any normal AWS CLI auth setup works, for example:
 
@@ -136,7 +141,8 @@ If that works in your shell, DeepKeep should be able to use the same credentials
 
 Yes.
 
-DeepKeep does not create buckets. The current S3 backend only performs object operations such as upload, download, listing, and object metadata lookups.
+DeepKeep does not create buckets. The current S3 backend only performs object operations
+such as upload, download, listing, and object metadata lookups.
 
 Create the bucket ahead of time.
 
@@ -187,7 +193,7 @@ backend:
 4. Run a backup:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml backup /path/to/source
+deepkeep.py --config deepkeep.yaml backup /path/to/source
 ```
 
 5. Inspect uploaded objects:
@@ -234,46 +240,46 @@ Notes:
 Backup:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml backup /path/to/source
+deepkeep.py --config deepkeep.yaml backup /path/to/source
 ```
 
 Restore a prefix:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml restore --dest /restore/path photos/2024/
+deepkeep.py --config deepkeep.yaml restore --dest /restore/path photos/2024/
 ```
 
 Restore everything:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml restore --dest /restore/path --all
+deepkeep.py --config deepkeep.yaml restore --dest /restore/path --all
 ```
 
 Disable Linux hardlink optimization during restore:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml restore --dest /restore/path --all --no-hardlinks
+deepkeep.py --config deepkeep.yaml restore --dest /restore/path --all --no-hardlinks
 ```
 
 Verify a pack:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml verify-pack <pack_id>
+deepkeep.py --config deepkeep.yaml verify-pack <pack_id>
 ```
 
 Rebuild the local catalog from stored packs:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml rebuild-catalog
+deepkeep.py --config deepkeep.yaml rebuild-catalog
 ```
 
 Browse the catalog:
 
 ```bash
-~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml catalog
-~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml catalog runs
-~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml catalog files --prefix photos/
-~/.venv/ai/bin/python deepkeep.py --config deepkeep.yaml catalog --plaintext
+deepkeep.py --config deepkeep.yaml catalog
+deepkeep.py --config deepkeep.yaml catalog runs
+deepkeep.py --config deepkeep.yaml catalog files --prefix photos/
+deepkeep.py --config deepkeep.yaml catalog --plaintext
 ```
 
 ## Current Limitations
