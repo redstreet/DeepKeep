@@ -1114,6 +1114,22 @@ def test_restore_reports_pending_archive_pack(fake_crypto, repo: tuple[Path, Pat
     assert "packs pending glacier restore: 1" in result.output
 
 
+def test_restore_reports_already_pending_archive_pack(fake_crypto, repo: tuple[Path, Path, Path], tmp_path: Path, monkeypatch) -> None:
+    source, _, config = repo
+    (source / "cold.txt").write_text("cold")
+    runner = CliRunner()
+    result = runner.invoke(deepkeep.cli, cli_args(config, "backup", str(source)))
+    assert result.exit_code == 0, result.output
+
+    monkeypatch.setattr(deepkeep.LocalBackend, "restore_status", lambda self, key: "pending")
+    dest = tmp_path / "restore"
+    result = runner.invoke(deepkeep.cli, cli_args(config, "restore", "--dest", str(dest), "cold"))
+    assert result.exit_code == 0, result.output
+    assert "restore already pending finished" in result.output
+    assert "requesting restore finished" not in result.output
+    assert "packs pending glacier restore: 1" in result.output
+
+
 def test_cli_reports_deepkeep_errors_cleanly(fake_crypto, repo: tuple[Path, Path, Path], monkeypatch) -> None:
     source, _, config = repo
     (source / "file.txt").write_text("x")

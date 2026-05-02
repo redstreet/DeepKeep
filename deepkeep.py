@@ -1618,6 +1618,9 @@ def restore_pack_ready(backend: StorageBackend, object_key: str, progress: PackP
     if status == "cold":
         with progress.stage("requesting restore"):
             return backend.request_restore(object_key)
+    if status == "pending":
+        with progress.stage("restore already pending"):
+            return status
     return status
 
 
