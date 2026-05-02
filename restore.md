@@ -34,27 +34,7 @@ Sources:
 
 ## Lowest-cost restore workflow
 
-### 1. Find the S3 object key
-
-DeepKeep stores packs under keys like:
-
-```text
-packs/YYYY/MM/pack-<pack_id>.tar.age
-```
-
-You can find the pack ID and object key with:
-
-```bash
-python deepkeep.py --config deepkeep.yaml catalog packs
-```
-
-or for a specific file:
-
-```bash
-python deepkeep.py --config deepkeep.yaml catalog file PATH/TO/FILE
-```
-
-### 2. Configure DeepKeep for lowest-cost restore
+### 1. Configure DeepKeep for lowest-cost restore
 
 Use this in your S3 backend config:
 
@@ -74,7 +54,7 @@ Notes:
 - `glacier_restore_days` controls how long the temporary restored copy stays available in S3
 - `5` is the current DeepKeep default
 
-### 3. Start the DeepKeep restore
+### 2. Start the DeepKeep restore
 
 Run the normal restore command:
 
@@ -91,7 +71,19 @@ restored: 0
 packs pending glacier restore: 1
 ```
 
-### 4. Check whether AWS is done
+DeepKeep is idempotent here:
+
+- if the pack is still `cold`, it requests a restore
+- if the restore is already `pending`, it does **not** request it again
+- if the pack is `ready`, it downloads and restores it
+
+So the normal workflow is just:
+
+1. run `deepkeep.py restore ...`
+2. if it says pending, wait
+3. run the **same command again**
+
+### 3. Optional: check whether AWS is done
 
 Run:
 
@@ -108,7 +100,7 @@ Look at the `Restore` field:
 
 If the object is ready, you may also see an expiry date for the temporary restored copy.
 
-### 5. Run the same DeepKeep restore command again
+### 4. Run the same DeepKeep restore command again
 
 Once AWS says the pack is ready, run the **same restore command again**:
 
