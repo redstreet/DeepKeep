@@ -1111,7 +1111,6 @@ class S3Backend:
                     }
                 ),
             ],
-            check=False,
         )
         return "pending"
 

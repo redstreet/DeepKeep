@@ -467,6 +467,40 @@ def test_s3_request_restore_uses_configured_tier_and_days(monkeypatch) -> None:
     assert request_payload == '{"Days": 5, "GlacierJobParameters": {"Tier": "Bulk"}}'
 
 
+def test_s3_request_restore_reports_failed_aws_request(monkeypatch) -> None:
+    monkeypatch.setattr(deepkeep, "require_tool", lambda name: None)
+    backend = deepkeep.S3Backend(
+        "glacier",
+        {
+            "type": "s3",
+            "bucket": "deepkeeptest",
+            "prefix": "dkt",
+            "storage_class": "DEEP_ARCHIVE",
+            "glacier_restore_tier": "Bulk",
+            "glacier_restore_days": 5,
+        },
+    )
+
+    def fake_subprocess_run(args, **kwargs):
+        if "head-object" in args:
+            return deepkeep.subprocess.CompletedProcess(args=args, returncode=0, stdout='{"StorageClass":"DEEP_ARCHIVE"}', stderr="")
+        raise deepkeep.subprocess.CalledProcessError(
+            returncode=1,
+            cmd=args,
+            output="restore request output",
+            stderr="InvalidObjectState",
+        )
+
+    monkeypatch.setattr(deepkeep.subprocess, "run", fake_subprocess_run)
+
+    with pytest.raises(deepkeep.DeepKeepError) as exc:
+        backend.request_restore("packs/x.tar.age")
+    message = str(exc.value)
+    assert "command failed with exit code 1" in message
+    assert "stdout:\nrestore request output" in message
+    assert "stderr:\nInvalidObjectState" in message
+
+
 def test_backup_dry_run_is_non_mutating_and_human_readable(fake_crypto, repo: tuple[Path, Path, Path]) -> None:
     source, storage, config = repo
     (source / "alpha.txt").write_text("alpha")
