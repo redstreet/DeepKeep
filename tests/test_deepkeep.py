@@ -121,6 +121,66 @@ def test_load_config_expands_user_and_env_paths(tmp_path: Path, monkeypatch) -> 
     assert loaded["backend"]["root"] == str(local_root / "archive")
 
 
+def test_load_config_sets_default_glacier_restore_settings_for_s3(tmp_path: Path) -> None:
+    config = tmp_path / "deepkeep.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "pack_size_mb: 1",
+                "age_pass_entry: backups/deepkeep",
+                "backend:",
+                "  type: s3",
+                "  bucket: my-bucket",
+                "  prefix: deepkeep",
+            ]
+        )
+    )
+
+    loaded = deepkeep.load_config(config)
+
+    assert loaded["backend"]["glacier_restore_tier"] == "Bulk"
+    assert loaded["backend"]["glacier_restore_days"] == 5
+
+
+def test_load_config_validates_glacier_restore_settings(tmp_path: Path) -> None:
+    config = tmp_path / "deepkeep.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "pack_size_mb: 1",
+                "age_pass_entry: backups/deepkeep",
+                "backend:",
+                "  type: s3",
+                "  bucket: my-bucket",
+                "  prefix: deepkeep",
+                "  glacier_restore_tier: Slowest",
+                "  glacier_restore_days: 0",
+            ]
+        )
+    )
+
+    with pytest.raises(deepkeep.DeepKeepError, match="glacier_restore_tier"):
+        deepkeep.load_config(config)
+
+    config.write_text(
+        "\n".join(
+            [
+                "pack_size_mb: 1",
+                "age_pass_entry: backups/deepkeep",
+                "backend:",
+                "  type: s3",
+                "  bucket: my-bucket",
+                "  prefix: deepkeep",
+                "  glacier_restore_tier: Bulk",
+                "  glacier_restore_days: 0",
+            ]
+        )
+    )
+
+    with pytest.raises(deepkeep.DeepKeepError, match="glacier_restore_days"):
+        deepkeep.load_config(config)
+
+
 def test_default_catalog_path_does_not_require_gz_suffix(tmp_path: Path) -> None:
     config = tmp_path / "deepkeep.yaml"
     config.write_text(
@@ -375,6 +435,36 @@ def test_s3_restore_status_uses_restore_header_for_archive_storage(monkeypatch) 
 
     monkeypatch.setattr(deepkeep, "run", fake_run)
     assert backend.restore_status("packs/x.tar.age") == "pending"
+
+
+def test_s3_request_restore_uses_configured_tier_and_days(monkeypatch) -> None:
+    monkeypatch.setattr(deepkeep, "require_tool", lambda name: None)
+    backend = deepkeep.S3Backend(
+        "glacier",
+        {
+            "type": "s3",
+            "bucket": "deepkeeptest",
+            "prefix": "dkt",
+            "storage_class": "DEEP_ARCHIVE",
+            "glacier_restore_tier": "Bulk",
+            "glacier_restore_days": 5,
+        },
+    )
+
+    seen: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        seen.append(args)
+        if "head-object" in args:
+            return deepkeep.subprocess.CompletedProcess(args=args, returncode=0, stdout='{"StorageClass":"DEEP_ARCHIVE"}', stderr="")
+        return deepkeep.subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(deepkeep, "run", fake_run)
+
+    assert backend.request_restore("packs/x.tar.age") == "pending"
+    restore_args = next(args for args in seen if "restore-object" in args)
+    request_payload = restore_args[restore_args.index("--restore-request") + 1]
+    assert request_payload == '{"Days": 5, "GlacierJobParameters": {"Tier": "Bulk"}}'
 
 
 def test_backup_dry_run_is_non_mutating_and_human_readable(fake_crypto, repo: tuple[Path, Path, Path]) -> None:

@@ -70,6 +70,8 @@ backend:
   bucket: my-backups
   prefix: deepkeep
   storage_class: DEEP_ARCHIVE
+  glacier_restore_tier: Bulk
+  glacier_restore_days: 5
 ```
 
 The first real backup binds the catalog to that exact backend config. If you later
@@ -102,6 +104,8 @@ backend:
   bucket: my-backups
   prefix: deepkeep
   storage_class: DEEP_ARCHIVE
+  glacier_restore_tier: Bulk
+  glacier_restore_days: 5
 ```
 
 Field notes:
@@ -115,6 +119,8 @@ Field notes:
 - `bucket`: S3 bucket name
 - `prefix`: object prefix inside the bucket
 - `storage_class`: S3 storage class used for uploads
+- `glacier_restore_tier`: retrieval tier DeepKeep requests for archived S3 restores; default `Bulk`
+- `glacier_restore_days`: number of days the temporary restored copy stays available in S3; default `5`
 
 ## AWS Authentication
 

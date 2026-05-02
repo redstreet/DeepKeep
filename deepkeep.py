@@ -559,6 +559,15 @@ def load_config(path: Path) -> dict[str, object]:
             if key not in cfg:
                 raise DeepKeepError(f"config.backend.{key} is required for s3 backend")
         cfg.setdefault("storage_class", "DEEP_ARCHIVE")
+        cfg.setdefault("glacier_restore_tier", "Bulk")
+        cfg.setdefault("glacier_restore_days", 5)
+        tier = str(cfg["glacier_restore_tier"])
+        if tier not in {"Bulk", "Standard", "Expedited"}:
+            raise DeepKeepError("config.backend.glacier_restore_tier must be one of Bulk, Standard, or Expedited")
+        days = int(cfg["glacier_restore_days"])
+        if days < 1:
+            raise DeepKeepError("config.backend.glacier_restore_days must be >= 1")
+        cfg["glacier_restore_days"] = days
     else:
         raise DeepKeepError("config.backend.type must be 'local' or 's3'")
     return data
@@ -1024,6 +1033,8 @@ class S3Backend:
         self.bucket = str(cfg["bucket"])
         self.prefix = str(cfg["prefix"]).strip("/")
         self.storage_class = str(cfg.get("storage_class", "DEEP_ARCHIVE"))
+        self.glacier_restore_tier = str(cfg.get("glacier_restore_tier", "Bulk"))
+        self.glacier_restore_days = int(cfg.get("glacier_restore_days", 5))
         require_tool("aws")
 
     def _uri(self, key: str) -> str:
@@ -1093,7 +1104,12 @@ class S3Backend:
                 "--key",
                 f"{self.prefix}/{key}",
                 "--restore-request",
-                '{"Days":7,"GlacierJobParameters":{"Tier":"Standard"}}',
+                json.dumps(
+                    {
+                        "Days": self.glacier_restore_days,
+                        "GlacierJobParameters": {"Tier": self.glacier_restore_tier},
+                    }
+                ),
             ],
             check=False,
         )

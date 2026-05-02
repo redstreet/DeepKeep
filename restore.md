@@ -4,12 +4,12 @@
 
 If your DeepKeep packs are in **S3 Glacier Deep Archive**, the cheapest retrieval option is **Bulk**.
 
-DeepKeep **does not currently let you choose the Glacier retrieval tier or restore duration**. Today, when it requests a restore itself, it uses:
+DeepKeep now defaults to:
 
-- `Tier=Standard`
-- `Days=7`
+- `Tier=Bulk`
+- `Days=5`
 
-So if you want the **lowest-cost** Deep Archive restore, use the **AWS CLI** first to request a **Bulk** restore, wait until AWS says the object is ready, and then run `deepkeep.py restore ...`.
+These defaults are configurable in your YAML file.
 
 ## What AWS does
 
@@ -54,24 +54,44 @@ or for a specific file:
 python deepkeep.py --config deepkeep.yaml catalog file PATH/TO/FILE
 ```
 
-### 2. Request a Bulk restore
+### 2. Configure DeepKeep for lowest-cost restore
 
-Run:
+Use this in your S3 backend config:
 
-```bash
-aws s3api restore-object \
-  --bucket YOUR_BUCKET \
-  --key YOUR_PREFIX/packs/YYYY/MM/pack-XXXXXXXXXXXX.tar.age \
-  --restore-request '{"Days":7,"GlacierJobParameters":{"Tier":"Bulk"}}'
+```yaml
+backend:
+  type: s3
+  bucket: my-bucket
+  prefix: deepkeep
+  storage_class: DEEP_ARCHIVE
+  glacier_restore_tier: Bulk
+  glacier_restore_days: 5
 ```
 
 Notes:
 
-- `Days` is how long the temporary restored copy stays available in S3
-- `Tier=Bulk` is the lowest-cost choice
-- Use a small number of days unless you know you need longer
+- `glacier_restore_tier: Bulk` is the lowest-cost Deep Archive option
+- `glacier_restore_days` controls how long the temporary restored copy stays available in S3
+- `5` is the current DeepKeep default
 
-### 3. Check whether AWS is done
+### 3. Start the DeepKeep restore
+
+Run the normal restore command:
+
+```bash
+python deepkeep.py --config deepkeep.yaml restore --dest restored SOME/PREFIX
+```
+
+If the required pack is still archived, DeepKeep will request the restore and stop.
+
+Typical output:
+
+```text
+restored: 0
+packs pending glacier restore: 1
+```
+
+### 4. Check whether AWS is done
 
 Run:
 
@@ -88,37 +108,36 @@ Look at the `Restore` field:
 
 If the object is ready, you may also see an expiry date for the temporary restored copy.
 
-### 4. Run the DeepKeep restore
+### 5. Run the same DeepKeep restore command again
 
-Once AWS says the pack is ready, run the normal DeepKeep restore command:
-
-```bash
-python deepkeep.py --config deepkeep.yaml restore --dest restored SOME/PREFIX
-```
-
-If multiple packs are involved, repeat the AWS restore request for each required pack before running DeepKeep again.
-
-## If you let DeepKeep request the restore
-
-If you run:
+Once AWS says the pack is ready, run the **same restore command again**:
 
 ```bash
 python deepkeep.py --config deepkeep.yaml restore --dest restored SOME/PREFIX
 ```
 
-and the pack is still archived, DeepKeep will request a restore and stop. Today it requests:
+If multiple packs are involved, AWS must finish restoring all of the required packs before DeepKeep can download them.
 
-- `Days=7`
-- `Tier=Standard`
+## Current defaults and overrides
 
-Typical output:
+If you do not set anything in config, DeepKeep currently uses:
 
-```text
-restored: 0
-packs pending glacier restore: 1
+- `glacier_restore_tier: Bulk`
+- `glacier_restore_days: 5`
+
+You can change them in config, for example:
+
+```yaml
+backend:
+  type: s3
+  bucket: my-bucket
+  prefix: deepkeep
+  storage_class: DEEP_ARCHIVE
+  glacier_restore_tier: Standard
+  glacier_restore_days: 2
 ```
 
-Then you wait and run the **same restore command again later**.
+DeepKeep passes those values to S3 `restore-object`.
 
 ## Should I delete the restored copy?
 
